@@ -1,0 +1,1 @@
+This repository contains tools to simulate systematic effects in galaxy surveys, both additive and multiplicative in nature, as well as tools to test the impact of the systematics on recovered power spectra from DESI mocks.
