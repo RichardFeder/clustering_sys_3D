@@ -1,0 +1,9 @@
+*.ipynb
+*.npz
+sfd/
+stars/
+*.pdf
+*.png
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]

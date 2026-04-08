@@ -6,20 +6,29 @@ from astropy.io import fits
 from astropy.cosmology import Planck18 as cosmo
 
 from contamination import *
+from mask_and_randoms import *
+from stitch_box import *
+from utils import *
+from halfdome import *
 
 
 class desi_mock():
 
-    mock_basedir = '/global/cfs/cdirs/desi/survey/catalogs/'
-    
+    desi_mock_basedir = '/global/cfs/cdirs/desi/survey/catalogs/'
+    quijote_mock_basedir = '/pscratch/sd/r/rmfeder/quijote_dat/'
+    halfdome_mock_basedir = '/global/cfs/cdirs/cmb/gsharing/halfdome/full_res/halos/'
+
+    # real DESI data
+    dr1_basepath = '/global/cfs/cdirs/desi/survey/catalogs/dr1/LSS/iron/LSScats/v1.5/'
+
     def __init__(self, year=3, mock_type='AbacusSummit_v4_1'):
 
-        self.mock_dir = self.mock_basedir+'Y'+str(year)+'/mocks/SecondGenMocks/'+mock_type+'/'
+        
+        self.mock_dir = self.desi_mock_basedir+'Y'+str(year)+'/mocks/SecondGenMocks/'+mock_type+'/'
         
         print('Mock directory is ', self.mock_dir)
 
         self.chi_interp = grab_chi_interp()
-
 
 
     def apply_redshift_selection(self, ra, dec, redshift, weight, zmin=None, zmax=None):
@@ -41,7 +50,6 @@ class desi_mock():
         print('length after selection is '+str(len(sel_redshift)))
 
         return sel_ra, sel_dec, sel_redshift, sel_weight
-
 
 
     def load_ezmock(self, mock_idx, galtype='ELG', zmin=None, zmax=None, apply_redshift_sel=False, downsamp_fac=None, gen_fkp=False, sel_fp=True):
@@ -75,10 +83,61 @@ class desi_mock():
 
 
         return cat_ra, cat_dec, cat_redshift, cat_nbar_z
+
+    def load_desi_dat(self, skystr = 'NGC', galtype = 'QSO', mode='data', rand_idx=1, apply_redshift_sel=False, \
+                     plot=False, inplace=False, zmin=None, zmax=None, combine_w_fkp=False):
+
+        if mode=='data':
+            filename = galtype+'_'+skystr+'_clustering.dat.fits'
+        elif mode=='random':
+            filename = galtype+'_'+skystr+'_'+str(rand_idx)+'_clustering.ran.fits'
+
+        dat = fits.open(self.dr1_basepath+filename)
+        
+        cat_ra, cat_dec, cat_redshift = [dat['LSS'].data[key] for key in ['RA', 'DEC', 'Z']]
+
+        cat_weight, cat_weight_fkp = [dat['LSS'].data[key] for key in ['WEIGHT', 'WEIGHT_FKP']]
+
+        if combine_w_fkp:
+            cat_weight *= cat_weight_fkp
+                                      
+        # cat_ra, cat_dec, cat_redshift, cat_weight = [dat['LSS'].data[key] for key in ['RA', 'DEC', 'Z', 'WEIGHT_FKP']]
+
+        if apply_redshift_sel:
+
+            if zmin is None and zmax is None:
+
+                if galtype=='QSO':
+                    zmin, zmax = 0.8, 3.1
+                elif galtype=='LRG':
+                    zmin, zmax = 0.4, 1.1
+                elif 'ELG' in galtype:
+                    zmin, zmax = 0.6, 1.6
+            
+            sel_ra, sel_dec, sel_redshift, sel_weight = self.apply_redshift_selection(cat_ra, cat_dec, cat_redshift, cat_weight, \
+                                 zmin=zmin, zmax=zmax)
+            
+        if plot:
+            plt.figure()
+            _, bins, _ = plt.hist(cat_redshift, bins=30, histtype='step', color='k', label='Full sample')
+            if apply_redshift_sel:
+                plt.hist(sel_redshift, bins=bins, histtype='step', color='r', label='After selection')
+            plt.legend()
+            plt.xlabel('Redshift')
+            plt.yscale('log')
+            plt.show()
+
+        if apply_redshift_sel:
+            return sel_ra, sel_dec, sel_redshift, sel_weight
+        else:
+            return cat_ra, cat_dec, cat_redshift, cat_weight
+
         
     def load_desi_mock(self, mock_idx, galtype='QSO_complete_SGC', zmin=None, zmax=None, mode='data', rand_idx=0, apply_redshift_sel=False, \
                       plot=False, inplace=False):
 
+        
+        
         if mode=='data':
             mock_fpath = self.mock_dir+'mock'+str(mock_idx)+'/'+galtype+'_clustering.dat.fits'
 
@@ -95,7 +154,6 @@ class desi_mock():
             sel_ra, sel_dec, sel_redshift, sel_weight = self.apply_redshift_selection(cat_ra, cat_dec, cat_redshift, cat_weight, \
                                  zmin=zmin, zmax=zmax)
             
-
         if plot:
             plt.figure()
             _, bins, _ = plt.hist(cat_redshift, bins=30, histtype='step', color='k', label='Full sample')
@@ -112,6 +170,51 @@ class desi_mock():
             return cat_ra, cat_dec, cat_redshift, cat_weight
 
 
+    def load_quijote_galpos(self, mock_idx, with_RSD=False, replicate=False, rep_fac=3, ds_fac=1, randomize=False):
+
+        
+        fpath = self.quijote_mock_basedir+str(mock_idx)+'/numpy/gal_Position.npy'
+        if with_RSD:
+            fpath = fpath.replace('Position', 'RSDPosition')
+        
+        print('fpath is ', fpath)
+        galpos = np.load(fpath)
+
+        boxdims = [np.max(galpos[:,i]) for i in range(3)]
+
+        print('boxdims:', boxdims)
+
+        boxlength = np.mean(boxdims)
+
+        h = cosmo.h
+
+        if replicate:
+
+            if ds_fac != 1:
+
+                # Randomly choose indices
+                N_sub = galpos.shape[0]//ds_fac
+                rng = np.random.default_rng(seed=42)  # optional: set seed for reproducibility
+                idx = rng.choice(galpos.shape[0], size=N_sub, replace=False)
+                galpos = galpos[idx]
+            
+            print('galpos initially has shape', galpos.shape)
+            galpos = stitch_boxes_randomized(galpos, np.mean(boxlength), rep_fac=rep_fac, randomize=randomize)
+            print('galpos now has shape', galpos.shape)
+
+        return galpos
+
+
+    def load_halfdome_mock(self, mockidx, n_sample=None):
+
+        mockidx_use = 100+2*mockidx
+        lightcone_fpath = self.halfdome_mock_basedir+'lightcone_'+str(mockidx_use)+'.hdf5'
+
+        positions, redshifts = load_lightcone_subset(lightcone_fpath, n_sample=n_sample)
+
+        return positions, redshifts
+
+        
     def convert_to_posarray(self, ra, dec, redshift):
 
         cat_r = cosmo.comoving_distance(redshift).value  # in Mpc/h
@@ -147,83 +250,6 @@ class desi_mock():
 
 
 
-def generate_random_catalog_from_data(data_ra, data_dec, data_z, data_nbar, n_randoms=10**6, P0=2600, nside=64, min_counts=10, seed=None):
-    """
-    Generate a random catalog matching the data's angular footprint and redshift distribution.
-
-    Parameters
-    ----------
-    data_ra : array_like
-        Right ascension of data catalog [deg].
-    data_dec : array_like
-        Declination of data catalog [deg].
-    data_z : array_like
-        Redshift of data catalog.
-    data_nbar : array_like
-        Corresponding nbar(z) values for the data catalog.
-    n_randoms : int
-        Number of random points to generate.
-    P0 : float
-        Power spectrum amplitude used in FKP weighting.
-    nside : int
-        HEALPix resolution to define the angular mask.
-    min_counts : int
-        Minimum number of data points in a pixel to be considered valid.
-    seed : int or None
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    rand_ra, rand_dec, rand_z, rand_nbar, rand_fkp : arrays
-        Angular and radial coordinates and weights of the random catalog.
-    """
-    rng = np.random.default_rng(seed)
-
-    # Convert data RA/Dec to HEALPix pixels
-    theta = np.radians(90. - data_dec)
-    phi = np.radians(data_ra)
-    pix = hp.ang2pix(nside, theta, phi, nest=False)
-
-    # Create a mask of valid pixels
-    npix = hp.nside2npix(nside)
-    counts = np.bincount(pix, minlength=npix)
-    valid_pix = np.where(counts >= min_counts)[0]
-    mask = np.zeros(npix, dtype=bool)
-    mask[valid_pix] = True
-
-    # Generate uniform points on the sphere and keep those in the mask
-    rand_ra, rand_dec = [], []
-    while len(rand_ra) < n_randoms:
-        ra_try = rng.uniform(0., 360., size=n_randoms)
-        dec_try = np.degrees(np.arcsin(rng.uniform(-1., 1., size=n_randoms)))
-
-        theta_try = np.radians(90. - dec_try)
-        phi_try = np.radians(ra_try)
-        pix_try = hp.ang2pix(nside, theta_try, phi_try, nest=False)
-
-        keep = mask[pix_try]
-        rand_ra.extend(ra_try[keep])
-        rand_dec.extend(dec_try[keep])
-
-        # Trim if oversampled
-        if len(rand_ra) > n_randoms:
-            rand_ra = rand_ra[:n_randoms]
-            rand_dec = rand_dec[:n_randoms]
-
-    rand_ra = np.array(rand_ra)
-    rand_dec = np.array(rand_dec)
-
-    # Sample redshifts and nbar(z) from the data catalog
-    rand_indices = rng.choice(len(data_z), size=n_randoms, replace=True)
-    rand_z = data_z[rand_indices]
-    rand_nbar = data_nbar[rand_indices]
-
-    # Compute FKP weights
-    rand_fkp = 1.0 / (1.0 + rand_nbar * P0)
-
-    return rand_ra, rand_dec, rand_z, rand_nbar, rand_fkp
-
-
 def test_contamination_on_mocks(mock, test_params=None, compute_clean=True, **kwargs):
 
     ''' Parent function in progress '''
@@ -257,6 +283,146 @@ def test_contamination_on_mocks(mock, test_params=None, compute_clean=True, **kw
     result_wsys = compute_plk(gal_posarray, gal_wfkp_wsys/np.mean(gal_wfkp_wsys), rand_pos, rand_fkp/np.mean(rand_fkp), kedges, plot_wedges=False, shotnoise=None, nmesh=nmesh)
 
     return result_wsys, result_clean
+
+
+def convert_to_ra_dec_distance(galpos_mpc_per_h, L_box_mpc_per_h):
+    center_offset_mpc = L_box_mpc_per_h / 2.0
+    x_relative = x_orig_mpc - center_offset_mpc
+    y_relative = y_orig_mpc - center_offset_mpc
+    z_relative = z_orig_mpc - center_offset_mpc
+
+    r = np.sqrt(x_relative**2 + y_relative**2 + z_relative**2) * u.Mpc
+    
+    ra_rad = np.arctan2(y_relative, x_relative)
+    ra_deg = np.degrees(ra_rad)
+    # Ensure RA is in [0, 360)
+    ra_deg[ra_deg < 0] += 360
+
+    dec_rad = np.arcsin(z_relative / r.value) # .value to remove units for arcsin
+    dec_deg = np.degrees(dec_rad)
+
+    return ra_deg, dec_deg, r
+
+def apply_healpix_mask(galpos_mpc_per_h: np.ndarray, L_box_mpc_per_h: float, h_value: float, mask_path: str, plot_masked_skymap: bool = False) -> np.ndarray:
+    """
+    Converts galaxy Cartesian coordinates to RA/DEC, applies a HEALPix survey mask,
+    and returns the original x/y/z coordinates for galaxies within the mask.
+
+    Parameters
+    ----------
+    galpos_mpc_per_h : np.ndarray
+        A 2D NumPy array (N_galaxies, 3) of galaxy positions (x, y, z)
+        in comoving Mpc/h units. Assumes all coordinates are positive,
+        and the observer is at the center of the L_box.
+    L_box_mpc_per_h : float
+        The side length of the cubic simulation box in comoving Mpc/h.
+    h_value : float
+        The dimensionless Hubble parameter, h (where H0 = 100 * h km/s/Mpc).
+    mask_path : str
+        The file path to the HEALPix FITS mask file. This mask should
+        contain pixel values where non-zero typically indicates a
+        valid survey region.
+    plot_masked_skymap : bool, optional
+        If True, a scatter plot of RA/DEC for the *masked* galaxies will be displayed.
+        Defaults to False.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D NumPy array (N_selected_galaxies, 3) containing the original
+        x, y, z coordinates (in Mpc/h) of the galaxies that fall within the
+        specified HEALPix mask.
+    """
+    print("--- Starting HEALPix Mask Application ---")
+    print(f"Input box size: {L_box_mpc_per_h:.2f} Mpc/h")
+    print(f"Using h = {h_value:.3f}")
+
+    # Convert coordinates and box size from Mpc/h to Mpc
+    x_orig_mpc = galpos_mpc_per_h[:, 0] * h_value
+    y_orig_mpc = galpos_mpc_per_h[:, 1] * h_value
+    z_orig_mpc = galpos_mpc_per_h[:, 2] * h_value
+    L_box_mpc = L_box_mpc_per_h * h_value
+
+    print(f"Converted box size: {L_box_mpc:.2f} Mpc")
+
+    # Translate coordinates to be relative to the box center (observer at 0,0,0)
+    center_offset_mpc = L_box_mpc / 2.0
+    x_relative = x_orig_mpc - center_offset_mpc
+    y_relative = y_orig_mpc - center_offset_mpc
+    z_relative = z_orig_mpc - center_offset_mpc
+
+    print(f"Number of input galaxies: {len(galpos_mpc_per_h)}")
+
+    # Calculate spherical coordinates (RA/DEC)
+    r = np.sqrt(x_relative**2 + y_relative**2 + z_relative**2) * u.Mpc
+
+    ra_rad = np.arctan2(y_relative, x_relative)
+    ra_deg = np.degrees(ra_rad)
+    # Ensure RA is in [0, 360)
+    ra_deg[ra_deg < 0] += 360
+
+    dec_rad = np.arcsin(z_relative / r.value) # .value to remove units for arcsin
+    dec_deg = np.degrees(dec_rad)
+
+    # --- Load and apply the HEALPix mask ---
+    print(f"Loading HEALPix mask from: {mask_path}")
+    try:
+        # hp.read_map by default returns a map in RING ordering.
+        # If your mask is in NESTED, you might want to specify nest=True here
+        # or convert it later. For simple masks, the ordering often doesn't matter
+        # as long as it's consistent in hp.ang2pix and the mask values.
+        survey_mask = hp.read_map(mask_path, field=0, verbose=False)
+        print(f"Mask NSIDE: {hp.npix2nside(len(survey_mask))}")
+    except FileNotFoundError:
+        print(f"Error: Mask file not found at {mask_path}")
+        return np.array([])
+    except Exception as e:
+        print(f"Error loading mask: {e}")
+        return np.array([])
+
+    # Get the NSIDE of the mask
+    nside_mask = hp.npix2nside(len(survey_mask))
+
+    # Convert galaxy RA/DEC to HEALPix pixel indices at the mask's resolution
+    galaxy_pixels = hp.ang2pix(nside_mask, ra_deg, dec_deg, lonlat=True, nest=False) # Assuming mask is RING
+
+    # Identify galaxies that fall within "valid" (non-zero) mask pixels
+    # A common convention for masks is 0 for masked, 1 for unmasked.
+    # If your mask uses hp.UNSEEN for masked values, that's also handled.
+    valid_galaxies_indices = np.where(survey_mask[galaxy_pixels] != 0)[0]
+    # You might want to be more explicit, e.g., survey_mask[galaxy_pixels] > 0
+    # depending on how your mask values are defined.
+
+    # Select the original galaxy positions that are within the mask
+    galpos_masked = galpos_mpc_per_h[valid_galaxies_indices]
+
+    print(f"Number of galaxies after mask application: {len(galpos_masked)}")
+
+    # --- Plotting (optional) ---
+    if plot_masked_skymap:
+        plt.figure(figsize=(10, 6))
+        # Plot only the RA/DEC of the galaxies that passed the mask
+        plt.scatter(ra_deg, dec_deg, s=1, color='k', alpha=0.1)
+        plt.xlabel("Right Ascension (degrees)")
+        plt.ylabel("Declination (degrees)")
+        plt.title(f"Galaxy Positions Before HEALPix Mask (N={len(galpos_masked)})")
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.tight_layout()
+        plt.show()
+        
+        plt.figure(figsize=(10, 6))
+        # Plot only the RA/DEC of the galaxies that passed the mask
+        plt.scatter(ra_deg[valid_galaxies_indices], dec_deg[valid_galaxies_indices], s=1, color='k', alpha=0.1)
+        plt.xlabel("Right Ascension (degrees)")
+        plt.ylabel("Declination (degrees)")
+        plt.title(f"Galaxy Positions After HEALPix Mask (N={len(galpos_masked)})")
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.tight_layout()
+        plt.show()
+
+    print("--- HEALPix Mask Application Complete ---")
+    return galpos_masked
+    
     
 
 

@@ -2,6 +2,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 from astropy.cosmology import Planck18 as cosmo
 from scipy.integrate import simps
+import astropy.units as u
 
 
 def init_test_params(**kwargs):
@@ -81,3 +82,63 @@ def compute_veff_from_galaxies(galaxy_z, weights, P0_k, nbins=100, sky_area_deg2
 
     Veff = simps(integrand, z_centers)  # integrate over z
     return Veff
+
+
+def gen_interp_fn_dcom_z(zmin=0, zmax=10):
+    ''' Compute interpolated function for chi --> z. Assumes Planck18 '''
+    h = cosmo.h
+
+    _z_grid = np.linspace(zmin, zmax, 10000)
+    _dcom_grid = cosmo.comoving_distance(_z_grid).value  # in Mpc
+    
+    # Create inverse interpolator: D_c -> z
+    dcom_to_z_interp = interp1d(_dcom_grid, _z_grid, kind='cubic', bounds_error=False, fill_value='extrapolate')
+
+    return dcom_to_z_interp
+
+def comoving_distance_to_redshift(dc_mpc, dcom_to_z_interp):
+    """
+    Vectorized conversion of comoving distance (Mpc) to redshift using interpolation.
+    
+    Parameters
+    ----------
+    dc_mpc : float or array-like
+        Comoving distance(s) in Mpc.
+
+    dcom_to_z_interp : float or array-like
+        Interpolating function to query redshift given distance
+
+    Returns
+    -------
+    z : float or ndarray
+        Redshift(s) corresponding to the input comoving distances.
+    """
+    dc_mpc = np.atleast_1d(dc_mpc)
+    z = dcom_to_z_interp(dc_mpc)
+    return z if z.ndim > 0 else z.item()
+
+def convert_to_ra_dec_distance(galpos_mpc_per_h, L_box_mpc_per_h, center_offset_mpc=None):
+    ''' Takes 3D positions and converts to RA/DEC/chi'''
+
+    x_orig, y_orig, z_orig = galpos_mpc_per_h[:,0], galpos_mpc_per_h[:,1], galpos_mpc_per_h[:,2]
+    if center_offset_mpc is None:
+        center_offset_mpc = L_box_mpc_per_h / 2.0
+
+    print('Center offset [Mpc/h]:', center_offset_mpc)
+        
+    x_relative = x_orig - center_offset_mpc
+    y_relative = y_orig - center_offset_mpc
+    z_relative = z_orig - center_offset_mpc
+
+    r = np.sqrt(x_relative**2 + y_relative**2 + z_relative**2) * u.Mpc
+    
+    ra_rad = np.arctan2(y_relative, x_relative)
+    ra_deg = np.degrees(ra_rad)
+    # Ensure RA is in [0, 360)
+    ra_deg[ra_deg < 0] += 360
+
+    dec_rad = np.arcsin(z_relative / r.value) # .value to remove units for arcsin
+    dec_deg = np.degrees(dec_rad)
+
+    return ra_deg, dec_deg, r
+    

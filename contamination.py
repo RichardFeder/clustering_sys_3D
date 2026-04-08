@@ -5,11 +5,15 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 import healpy as hp
-from astropy.coordinates import SkyCoord
-import astropy.units as u
 from tqdm import tqdm
-
 from scipy.stats import rv_histogram, norm, uniform
+
+from astropy.coordinates import SkyCoord
+from astropy.coordinates import Galactic, ICRS
+from astropy import units as u
+from astropy.coordinates import FK5, FK4 # Import these for potential transformations if needed, but ICRS is usually the target.
+
+from star_sim import *
 
 
 class contam():
@@ -93,7 +97,6 @@ class contam():
             unif_dist = uniform(loc=zmin, scale=zmax-zmin)
             redshift_star = unif_dist.rvs(size=len(ra_star))
     
-
         return ra_star, dec_star, redshift_star
         
         
