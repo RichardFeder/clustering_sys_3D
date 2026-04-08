@@ -13,6 +13,7 @@ from astropy.coordinates import Galactic, ICRS
 from astropy import units as u
 from astropy.coordinates import FK5, FK4 # Import these for potential transformations if needed, but ICRS is usually the target.
 
+from dust import gen_sfd_hp
 from star_sim import *
 
 
@@ -112,15 +113,13 @@ class contam():
 
         if use_cl_sfd:
             self.ebv_map, self.cl_sfd = gen_sfd_hp()
-            self.delta_ebv = gen_delta_ebv_map_uncorr(self.cl_sfd, std=debv_std[d])
-
-        elif use_sfd_rongpu_resid:
-            self.delta_ebv = None # todo
+            self.delta_ebv = gen_delta_ebv_map_uncorr(self.cl_sfd, std=debv_std)
             
         else:
             self.delta_ebv = np.random.normal(loc=0.0, scale=debv_std, size=self.npix)
             
         self.delta_n_over_n_uncorr = gen_dn_n_map(grf_map=self.delta_ebv, alpha=alpha)
+        return self.delta_n_over_n_uncorr
 
 
 
@@ -159,7 +158,7 @@ def load_gaia_stellar_density(fpath=None, plot=True, vmax=500):
     return stellar_map
 
 
-def poisson_star_map_from_fraction(stellar_map, N_gal, frac=0.05, mask=None):
+def poisson_star_map_from_fraction(stellar_map, N_gal, frac=0.05, mask=None, seed=None):
 
     map_clean = np.copy(stellar_map)
     map_clean = np.nan_to_num(map_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -181,7 +180,8 @@ def poisson_star_map_from_fraction(stellar_map, N_gal, frac=0.05, mask=None):
     expected_stars = prob_map * N_star
 
     # Poisson draw
-    star_counts = np.random.poisson(expected_stars)
+    rng = np.random.default_rng(seed)
+    star_counts = rng.poisson(expected_stars)
 
     return star_counts
 
@@ -236,10 +236,17 @@ def generate_poisson_radec_from_map(poisson_mean_map, seed=None):
     return ra_deg, dec_deg
 
 
-def gen_delta_ebv_map_uncorr(cl_sfd, nside=256, std=0.01):
+def gen_delta_ebv_map_uncorr(cl_sfd, nside=256, std=0.01, seed=None):
     
+    state = np.random.get_state()
+    if seed is not None:
+        np.random.seed(seed)
+
     # Simulate GRF with same power spectrum
     grf_map = hp.synfast(cl_sfd, nside=nside, lmax=len(cl_sfd)-1, new=True)
+
+    if seed is not None:
+        np.random.set_state(state)
     
     # Normalize to have std ~ 0.01
     grf_map -= np.mean(grf_map)
@@ -248,10 +255,10 @@ def gen_delta_ebv_map_uncorr(cl_sfd, nside=256, std=0.01):
     return grf_map
 
 
-def gen_dn_n_map(cl_sfd=None, grf_map=None, alpha=-10, std=0.01):
+def gen_dn_n_map(cl_sfd=None, grf_map=None, alpha=-10, std=0.01, seed=None):
 
     if grf_map is None:
-        grf_map = gen_delta_ebv_map_uncorr(cl_sfd, std=std)
+        grf_map = gen_delta_ebv_map_uncorr(cl_sfd, std=std, seed=seed)
 
     dn_n = alpha * grf_map
 

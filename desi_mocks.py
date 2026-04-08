@@ -170,7 +170,7 @@ class desi_mock():
             return cat_ra, cat_dec, cat_redshift, cat_weight
 
 
-    def load_quijote_galpos(self, mock_idx, with_RSD=False, replicate=False, rep_fac=3, ds_fac=1, randomize=False):
+    def load_quijote_galpos(self, mock_idx, with_RSD=False, replicate=False, rep_fac=3, ds_fac=1, randomize=False, seed=42):
 
         
         fpath = self.quijote_mock_basedir+str(mock_idx)+'/numpy/gal_Position.npy'
@@ -194,7 +194,7 @@ class desi_mock():
 
                 # Randomly choose indices
                 N_sub = galpos.shape[0]//ds_fac
-                rng = np.random.default_rng(seed=42)  # optional: set seed for reproducibility
+                rng = np.random.default_rng(seed)
                 idx = rng.choice(galpos.shape[0], size=N_sub, replace=False)
                 galpos = galpos[idx]
             

@@ -2,20 +2,21 @@ import numpy as np
 import healpy as hp
 from astropy.cosmology import Planck18 as cosmo
 
-def generate_uniform_randoms(chi_interp, n_randoms, zmin=0.4, zmax=1.0, data_z=None):
+def generate_uniform_randoms(chi_interp, n_randoms, zmin=0.4, zmax=1.0, data_z=None, seed=None):
+    rng = np.random.default_rng(seed)
+
     # Uniform RA
-    ra = np.random.uniform(0, 360, n_randoms)
+    ra = rng.uniform(0, 360, n_randoms)
 
     # Uniform sin(Dec)
-    sin_dec = np.random.uniform(-1, 1, n_randoms)
+    sin_dec = rng.uniform(-1, 1, n_randoms)
     dec = np.degrees(np.arcsin(sin_dec))
     
     # Uniform z or weighted z
 
     if data_z is None:
-        z = np.random.uniform(zmin, zmax, n_randoms)  # or use a dN/dz sampling
+        z = rng.uniform(zmin, zmax, n_randoms)  # or use a dN/dz sampling
     else:
-        rng = np.random.default_rng(seed=42)  # optional: set seed for reproducibility
         rand_indices = rng.choice(len(data_z), size=n_randoms, replace=True)
         z = data_z[rand_indices]
     
