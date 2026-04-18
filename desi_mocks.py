@@ -21,12 +21,13 @@ class desi_mock():
     # real DESI data
     dr1_basepath = '/global/cfs/cdirs/desi/survey/catalogs/dr1/LSS/iron/LSScats/v1.5/'
 
-    def __init__(self, year=3, mock_type='AbacusSummit_v4_1'):
+    def __init__(self, year=3, mock_type='AbacusSummit_v4_1', verbose=False):
 
         
         self.mock_dir = self.desi_mock_basedir+'Y'+str(year)+'/mocks/SecondGenMocks/'+mock_type+'/'
-        
-        print('Mock directory is ', self.mock_dir)
+
+        if verbose:
+            print('Mock directory is ', self.mock_dir)
 
         self.chi_interp = grab_chi_interp()
 

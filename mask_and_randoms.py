@@ -17,11 +17,17 @@ def generate_uniform_randoms(chi_interp, n_randoms, zmin=0.4, zmax=1.0, data_z=N
     if data_z is None:
         z = rng.uniform(zmin, zmax, n_randoms)  # or use a dN/dz sampling
     else:
-        rand_indices = rng.choice(len(data_z), size=n_randoms, replace=True)
-        z = data_z[rand_indices]
+        if len(data_z) == 0:
+            z = rng.uniform(zmin, zmax, n_randoms)
+        else:
+            rand_indices = rng.choice(len(data_z), size=n_randoms, replace=True)
+            z = data_z[rand_indices]
     
     r_gal_mpc = chi_interp(z)
-    print('min/max rgal:', np.min(r_gal_mpc), np.max(r_gal_mpc))
+    if len(r_gal_mpc) > 0:
+        print('min/max rgal:', np.min(r_gal_mpc), np.max(r_gal_mpc))
+    else:
+        print('No redshifts sampled for randoms; returning empty random catalog.')
 
     r = r_gal_mpc * cosmo.h  # if your mock is in Mpc/h
 

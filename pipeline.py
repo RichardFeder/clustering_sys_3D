@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 from astropy.cosmology import Planck18 as cosmo
 
+from nonunif_binning import compute_null_bins
+
 from contamination import (
     gen_delta_ebv_map_uncorr,
     gen_dn_n_map,
@@ -27,32 +29,38 @@ from utils import (
 )
 
 
+DEFAULT_QUIJOTE_BASEDIR = '/global/cfs/cdirs/desi/users/rmfeder/quijote/fiducial/systematics/'
+DEFAULT_HALFDOME_BASEDIR = '/global/cfs/cdirs/cmb/gsharing/halfdome/full_res/halos/'
+
+
 @dataclass(frozen=True)
 class ExperimentSpec:
-    mock_type: str = 'quijote'
+    mock_type: str = 'halfdome'
     with_rsd: bool = False
     contamination_mode: str = 'none'
-    frac_stellar_contam: float = 0.01
-    use_gaia: bool = True
+    frac_stellar_contam: float = 0.1
+    use_gaia: bool = False
     sfd_std: float = 0.01
     dust_alpha: float = -10.0
-    redshift_sel: bool = False
+    redshift_sel: bool = True
     zmin: float = 0.4
     zmax: float = 1.0
     replicate: bool = False
-    rep_fac: int = 3
-    ds_fac: int = 100
+    rep_fac: int = 1
+    ds_fac: int = 5
     randomize: bool = False
     n_sample: int = 20_000_000
-    k_min: float = 0.005
+    k_min: float = 0.002
     k_max: float = 0.2
     delta_k: float = 0.01
     mu_min: float = 0.0
     mu_max: float = 1.0
     nwedge: int = 6
     mu_wedges: tuple[float, ...] | None = None
-    ells: tuple[int, ...] = (0, 2, 4, 6, 8)
-    nmesh: int = 256
+    mu_binning_strategy: str = 'nonuniform'
+    n_clean_bins: int = 8
+    ells: tuple[int, ...] = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+    nmesh: int = 512
     boxsize: float = 1000.0
     n_random_factor: int = 5
     seed: int = 42
@@ -60,6 +68,9 @@ class ExperimentSpec:
     output_name: str | None = None
     plot: bool = False
     nplot: int = 0
+    quijote_basedir: str = DEFAULT_QUIJOTE_BASEDIR
+    halfdome_basedir: str = DEFAULT_HALFDOME_BASEDIR
+    quijote_geometry: str = 'replicated'
 
 
 @dataclass
@@ -103,11 +114,25 @@ def build_kedges(spec: ExperimentSpec) -> np.ndarray:
 def build_mu_wedges(spec: ExperimentSpec) -> np.ndarray:
     if spec.mu_wedges is not None:
         return np.asarray(spec.mu_wedges, dtype=float)
-    return np.linspace(spec.mu_min, spec.mu_max, spec.nwedge)
+
+    strategy = spec.mu_binning_strategy.lower()
+    if strategy == 'nonuniform':
+        ell_max = max(spec.ells)
+        return np.asarray(
+            compute_null_bins(ell_max=ell_max, n_clean_bins=spec.n_clean_bins),
+            dtype=float,
+        )
+
+    if strategy == 'uniform':
+        return np.linspace(spec.mu_min, spec.mu_max, spec.nwedge)
+
+    raise ValueError(f'Unknown mu_binning_strategy: {spec.mu_binning_strategy}')
 
 
 def build_run_label(spec: ExperimentSpec) -> str:
     parts = [spec.mock_type]
+    if spec.mock_type == 'quijote':
+        parts.append(spec.quijote_geometry)
     parts.append('rsd' if spec.with_rsd else 'noRSD')
     parts.append(spec.contamination_mode)
     if spec.contamination_mode in {'stellar', 'both'}:
@@ -123,10 +148,50 @@ def build_run_label(spec: ExperimentSpec) -> str:
     if spec.ds_fac != 1:
         parts.append(f'ds{spec.ds_fac}')
     if spec.mu_wedges is not None:
-        parts.append('nonunifmu')
+        parts.append('manualmu')
+    elif spec.mu_binning_strategy.lower() == 'nonuniform':
+        parts.append(f'nonunifmu{spec.n_clean_bins}')
     else:
-        parts.append(f'lmax{max(spec.ells)}')
+        parts.append('unifmu')
+
+    parts.append(f'lmax{max(spec.ells)}')
     return '_'.join(parts)
+
+
+def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
+    """Return recommended base kwargs for the current pipeline defaults."""
+    mock_type_norm = mock_type.lower()
+    if mock_type_norm not in {'halfdome', 'quijote'}:
+        raise ValueError(
+            f"Unsupported mock_type='{mock_type}'. Supported options are 'halfdome' and 'quijote'."
+        )
+
+    return {
+        'mock_type': mock_type_norm,
+        'with_rsd': False,
+        'contamination_mode': 'none',
+        'frac_stellar_contam': 0.1,
+        'use_gaia': False,
+        'sfd_std': 0.01,
+        'dust_alpha': -10.0,
+        'redshift_sel': True,
+        'zmin': 0.4,
+        'zmax': 1.0,
+        'replicate': False,
+        'rep_fac': 1,
+        'ds_fac': 5,
+        'randomize': False,
+        'n_sample': 20_000_000,
+        'k_min': 0.002,
+        'k_max': 0.2,
+        'delta_k': 0.01,
+        'mu_binning_strategy': 'nonuniform',
+        'n_clean_bins': 8,
+        'ells': (0, 2, 4, 6, 8, 10, 12, 14, 16),
+        'nmesh': 512,
+        'seed': 42,
+        'quijote_geometry': 'full_cube' if mock_type_norm == 'quijote' else 'replicated',
+    }
 
 
 def append_run_ledger(save_dir: str, entry: dict[str, Any]) -> str:
@@ -150,6 +215,13 @@ def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> dict[str, int]:
 
 
 def _prepare_quijote_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock) -> PreparedCatalog:
+    if not spec.quijote_basedir.endswith('/'):
+        quijote_basedir = spec.quijote_basedir + '/'
+    else:
+        quijote_basedir = spec.quijote_basedir
+
+    dm.quijote_mock_basedir = quijote_basedir
+
     galpos = dm.load_quijote_galpos(
         mock_idx,
         with_RSD=spec.with_rsd,
@@ -178,7 +250,31 @@ def _prepare_quijote_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock)
         base_redshifts=base_redshifts,
         base_r=r_values,
         mock_idx=mock_idx,
-        metadata={'boxsize_use': boxsize_use},
+        metadata={'boxsize_use': boxsize_use, 'quijote_basedir': quijote_basedir},
+    )
+
+
+def _prepare_halfdome_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock) -> PreparedCatalog:
+    if not spec.halfdome_basedir.endswith('/'):
+        halfdome_basedir = spec.halfdome_basedir + '/'
+    else:
+        halfdome_basedir = spec.halfdome_basedir
+
+    dm.halfdome_mock_basedir = halfdome_basedir
+    galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=spec.n_sample)
+
+    ra, dec, r = convert_to_ra_dec_distance(galpos, spec.boxsize, center_offset_mpc=0.0)
+    r_values = np.asarray(r.value if hasattr(r, 'value') else r)
+    positions_rdd = np.vstack([ra, dec, r_values])
+    weights = np.ones_like(ra, dtype=float)
+
+    return PreparedCatalog(
+        positions_rdd=positions_rdd,
+        weights=weights,
+        base_redshifts=np.asarray(redshift),
+        base_r=r_values,
+        mock_idx=mock_idx,
+        metadata={'boxsize_use': spec.boxsize, 'halfdome_basedir': halfdome_basedir},
     )
 
 
@@ -260,6 +356,9 @@ def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tup
         redshift_source = catalog.base_redshifts
         if redshift_source is None:
             raise ValueError('Redshift selection requested but no base redshifts were prepared.')
+        if len(redshift_source) == 0:
+            print('Warning: redshift-selected data is empty; falling back to uniform random z sampling in [zmin, zmax].')
+            redshift_source = None
         ra_rand, dec_rand, r_rand, _ = generate_uniform_randoms(
             chi_interp,
             n_randoms,
@@ -311,13 +410,17 @@ def _compute_power_spectra(
 
 
 def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | None = None) -> ExperimentResult:
-    if spec.mock_type != 'quijote':
-        raise NotImplementedError('Current runner only implements quijote in the first pass.')
-
     if dm is None:
         dm = desi_mock()
 
-    catalog = _prepare_quijote_catalog(spec, mock_idx, dm)
+    if spec.mock_type == 'quijote':
+        catalog = _prepare_quijote_catalog(spec, mock_idx, dm)
+    elif spec.mock_type == 'halfdome':
+        catalog = _prepare_halfdome_catalog(spec, mock_idx, dm)
+    else:
+        raise NotImplementedError(
+            f"Unsupported mock_type='{spec.mock_type}'. Supported options are 'quijote' and 'halfdome'."
+        )
 
     if spec.redshift_sel:
         redshift_mask = np.ones_like(catalog.base_redshifts, dtype=bool)
@@ -329,6 +432,12 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
         catalog.weights = catalog.weights[redshift_mask]
         catalog.base_redshifts = catalog.base_redshifts[redshift_mask]
         catalog.base_r = catalog.base_r[redshift_mask]
+        if catalog.positions_rdd.shape[1] == 0:
+            raise ValueError(
+                f'Redshift selection z=[{spec.zmin}, {spec.zmax}] removed all objects for mock_idx={mock_idx}. '
+                'This can happen for Quijote variants depending on box geometry. '
+                'Try lowering zmin, enabling replication (replicate=True), or disabling redshift_sel.'
+            )
 
     catalog = _apply_contamination(spec, catalog, mock_idx)
     rand_positions, rand_weights = _build_random_catalog(spec, catalog)
@@ -400,26 +509,73 @@ def run_variant_collection(
     return results
 
 
+def _normalize_options(values: Any, *, name: str) -> tuple[Any, ...]:
+    if values is None:
+        return tuple()
+    if isinstance(values, str):
+        return (values,)
+    if np.isscalar(values):
+        return (values,)
+    return tuple(values)
+
+
+def _coerce_bool_options(values: Any, *, name: str) -> tuple[bool, ...]:
+    normalized = _normalize_options(values, name=name)
+    coerced: list[bool] = []
+    for value in normalized:
+        if isinstance(value, bool):
+            coerced.append(value)
+            continue
+
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {'true', 't', '1', 'yes', 'y'}:
+                coerced.append(True)
+                continue
+            if text in {'false', 'f', '0', 'no', 'n'}:
+                coerced.append(False)
+                continue
+
+        raise ValueError(f"Unsupported boolean value in {name}: {value!r}")
+
+    return tuple(coerced)
+
+
 def build_quijote_variant_specs(
     with_rsd_options: tuple[bool, ...] = (False, True),
     contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
     stellar_fracs: tuple[float, ...] = (0.01,),
     sfd_stds: tuple[float, ...] = (0.01,),
+    quijote_geometry: str = 'full_cube',
     base_kwargs: dict[str, Any] | None = None,
 ) -> list[ExperimentSpec]:
     base_kwargs = dict(base_kwargs or {})
     specs: list[ExperimentSpec] = []
+    with_rsd_options = _coerce_bool_options(with_rsd_options, name='with_rsd_options')
+    contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
+    stellar_fracs = _normalize_options(stellar_fracs, name='stellar_fracs')
+    sfd_stds = _normalize_options(sfd_stds, name='sfd_stds')
+
+    if quijote_geometry not in {'full_cube', 'replicated'}:
+        raise ValueError(
+            f"Unsupported quijote_geometry='{quijote_geometry}'. Supported options are 'full_cube' and 'replicated'."
+        )
+
+    # Use explicitly provided sweep values as the canonical defaults, even for
+    # contamination modes where that parameter is not active.
+    default_stellar = stellar_fracs[0] if len(stellar_fracs) > 0 else base_kwargs.get('frac_stellar_contam', 0.01)
+    default_dust = sfd_stds[0] if len(sfd_stds) > 0 else base_kwargs.get('sfd_std', 0.01)
 
     for with_rsd, contamination_mode in product(with_rsd_options, contamination_modes):
         if contamination_mode in {'stellar', 'both'}:
             stellar_values = stellar_fracs
         else:
-            stellar_values = (base_kwargs.get('frac_stellar_contam', 0.01),)
+            stellar_values = (default_stellar,)
 
         if contamination_mode in {'dust', 'both'}:
             dust_values = sfd_stds
         else:
-            dust_values = (base_kwargs.get('sfd_std', 0.01),)
+            dust_values = (default_dust,)
 
         for frac_stellar_contam, sfd_std in product(stellar_values, dust_values):
             spec_kwargs = dict(base_kwargs)
@@ -430,11 +586,97 @@ def build_quijote_variant_specs(
                     'contamination_mode': contamination_mode,
                     'frac_stellar_contam': frac_stellar_contam,
                     'sfd_std': sfd_std,
+                    'quijote_geometry': quijote_geometry,
+                }
+            )
+            if quijote_geometry == 'full_cube' and not spec_kwargs.get('replicate', False):
+                spec_kwargs['redshift_sel'] = False
+            specs.append(ExperimentSpec(**spec_kwargs))
+
+    return specs
+
+
+def build_halfdome_variant_specs(
+    contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
+    stellar_fracs: tuple[float, ...] = (0.01,),
+    sfd_stds: tuple[float, ...] = (0.01,),
+    base_kwargs: dict[str, Any] | None = None,
+) -> list[ExperimentSpec]:
+    base_kwargs = dict(base_kwargs or {})
+    specs: list[ExperimentSpec] = []
+    contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
+    stellar_fracs = _normalize_options(stellar_fracs, name='stellar_fracs')
+    sfd_stds = _normalize_options(sfd_stds, name='sfd_stds')
+
+    # Use explicitly provided sweep values as the canonical defaults, even for
+    # contamination modes where that parameter is not active.
+    default_stellar = stellar_fracs[0] if len(stellar_fracs) > 0 else base_kwargs.get('frac_stellar_contam', 0.01)
+    default_dust = sfd_stds[0] if len(sfd_stds) > 0 else base_kwargs.get('sfd_std', 0.01)
+
+    for contamination_mode in contamination_modes:
+        if contamination_mode in {'stellar', 'both'}:
+            stellar_values = stellar_fracs
+        else:
+            stellar_values = (default_stellar,)
+
+        if contamination_mode in {'dust', 'both'}:
+            dust_values = sfd_stds
+        else:
+            dust_values = (default_dust,)
+
+        for frac_stellar_contam, sfd_std in product(stellar_values, dust_values):
+            spec_kwargs = dict(base_kwargs)
+            spec_kwargs.update(
+                {
+                    'mock_type': 'halfdome',
+                    'with_rsd': False,
+                    'contamination_mode': contamination_mode,
+                    'frac_stellar_contam': frac_stellar_contam,
+                    'sfd_std': sfd_std,
                 }
             )
             specs.append(ExperimentSpec(**spec_kwargs))
 
     return specs
+
+
+def build_mock_variant_specs(
+    mock_type: str,
+    contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
+    stellar_fracs: tuple[float, ...] = (0.01,),
+    sfd_stds: tuple[float, ...] = (0.01,),
+    with_rsd_options: tuple[bool, ...] = (False, True),
+    quijote_geometry: str = 'full_cube',
+    base_kwargs: dict[str, Any] | None = None,
+) -> list[ExperimentSpec]:
+    """Build variant specs for either halfdome or quijote using one entry point."""
+    mock_type_norm = mock_type.lower()
+    contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
+    stellar_fracs = _normalize_options(stellar_fracs, name='stellar_fracs')
+    sfd_stds = _normalize_options(sfd_stds, name='sfd_stds')
+    with_rsd_options = _coerce_bool_options(with_rsd_options, name='with_rsd_options')
+
+    if mock_type_norm == 'quijote':
+        return build_quijote_variant_specs(
+            with_rsd_options=with_rsd_options,
+            contamination_modes=contamination_modes,
+            stellar_fracs=stellar_fracs,
+            sfd_stds=sfd_stds,
+            quijote_geometry=quijote_geometry,
+            base_kwargs=base_kwargs,
+        )
+
+    if mock_type_norm == 'halfdome':
+        return build_halfdome_variant_specs(
+            contamination_modes=contamination_modes,
+            stellar_fracs=stellar_fracs,
+            sfd_stds=sfd_stds,
+            base_kwargs=base_kwargs,
+        )
+
+    raise ValueError(
+        f"Unsupported mock_type='{mock_type}'. Supported options are 'halfdome' and 'quijote'."
+    )
 
 
 def save_experiment_result(result: ExperimentResult) -> str:

@@ -13,7 +13,6 @@ from astropy.coordinates import Galactic, ICRS
 from astropy import units as u
 from astropy.coordinates import FK5, FK4 # Import these for potential transformations if needed, but ICRS is usually the target.
 
-from dust import gen_sfd_hp
 from star_sim import *
 
 
@@ -112,6 +111,7 @@ class contam():
         '''
 
         if use_cl_sfd:
+            from dust import gen_sfd_hp
             self.ebv_map, self.cl_sfd = gen_sfd_hp()
             self.delta_ebv = gen_delta_ebv_map_uncorr(self.cl_sfd, std=debv_std)
             

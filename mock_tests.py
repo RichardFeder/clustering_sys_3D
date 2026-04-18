@@ -8,7 +8,17 @@ from pscalc import *
 from utils import *
 from dust import *
 from star_sim import *
-from pipeline import ExperimentSpec, build_quijote_variant_specs, run_experiment_grid, run_single_experiment, run_variant_collection, save_experiment_result
+from pipeline import (
+    ExperimentSpec,
+    build_halfdome_variant_specs,
+    build_mock_variant_specs,
+    build_quijote_variant_specs,
+    recommended_base_kwargs,
+    run_experiment_grid,
+    run_single_experiment,
+    run_variant_collection,
+    save_experiment_result,
+)
 
 def compute_pkmu_mocks(nmock, k_min=0.005, k_max=0.2, delta_k=0.01, mu_min=0., mu_max=1., nwedge=6, \
                       ells = (0, 2, 4, 6, 8), nmesh=256, with_RSD=False, boxsize=1000., with_sfd_contam=False, sfd_std=0.01, plot=False, \

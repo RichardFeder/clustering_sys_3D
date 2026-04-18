@@ -1,7 +1,10 @@
 import numpy as np
 from scipy.interpolate import interp1d
 from astropy.cosmology import Planck18 as cosmo
-from scipy.integrate import simps
+try:
+    from scipy.integrate import simps
+except ImportError:
+    from scipy.integrate import simpson as simps
 import astropy.units as u
 
 

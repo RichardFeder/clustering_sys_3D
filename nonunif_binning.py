@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import cumtrapz
+try:
+    from scipy.integrate import cumulative_trapezoid as _cumtrapz
+except ImportError:
+    from scipy.integrate import cumtrapz as _cumtrapz
 from scipy.special import legendre
 
 def transverse_response(mu, ell_max):
@@ -28,7 +31,7 @@ def compute_null_bins(ell_max, n_clean_bins):
     R = response_delta_mu0(mu_vals, ell_max)
 
     # Cumulative integral from mu_junk_upper upwards
-    cum_integral = cumtrapz(R, mu_vals, initial=0)
+    cum_integral = _cumtrapz(R, mu_vals, initial=0)
 
     # Find zero crossings of the cumulative integral after mu_junk_upper
     zero_crossings = []
