@@ -1,5 +1,7 @@
 # clustering_sys_3D
 
+Link to systematics slides: https://docs.google.com/presentation/d/1liZCIqkNHbXLtBpNkk-0Asfcy5aGfCu0Pm_kYIF_Py4/edit?usp=sharing
+
 Tools for simulating survey systematics in DESI-like large-scale structure analyses and measuring their impact on recovered power spectra.
 
 The main science goal is to quantify biases from additive and multiplicative systematics, especially on large scales where PNG-like signals can appear.
