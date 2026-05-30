@@ -624,8 +624,8 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
     kedges = build_kedges(spec)
     nkbin = len(kedges) - 1
     nwedge = len(mu_wedges) - 1
-    all_pkmu = np.zeros((nmock, nkbin, nwedge))
-    all_plk = np.zeros((nmock, len(spec.ells), nkbin))
+    all_pkmu = np.zeros((nmock, nkbin, nwedge), dtype=complex)
+    all_plk = np.zeros((nmock, len(spec.ells), nkbin), dtype=complex)
     kcen = None
     run_records: list[dict[str, Any]] = []
 
