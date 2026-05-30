@@ -7,11 +7,13 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
+import healpy as hp
 from astropy.cosmology import Planck18 as cosmo
 
 from nonunif_binning import compute_null_bins
 
 from contamination import (
+    gen_controlled_transverse_map,
     gen_delta_ebv_map_uncorr,
     gen_dn_n_map,
     generate_poisson_radec_from_map,
@@ -71,6 +73,12 @@ class ExperimentSpec:
     quijote_basedir: str = DEFAULT_QUIJOTE_BASEDIR
     halfdome_basedir: str = DEFAULT_HALFDOME_BASEDIR
     quijote_geometry: str = 'replicated'
+    # Controlled transverse systematic parameters
+    sys_amp: float = 0.01
+    sys_spec_type: str = 'power_law'
+    sys_ell_min: int = 6
+    sys_ell_max: int = 64
+    sys_ell_delta: int | None = None
 
 
 @dataclass
@@ -141,6 +149,14 @@ def build_run_label(spec: ExperimentSpec) -> str:
     if spec.contamination_mode in {'dust', 'both'}:
         parts.append(f'dust{_slug_number(spec.sfd_std)}')
         parts.append(f'a{_slug_number(spec.dust_alpha)}')
+    if spec.contamination_mode in {'transverse_additive', 'transverse_multiplicative'}:
+        parts.append(spec.sys_spec_type)
+        parts.append(f'amp{_slug_number(spec.sys_amp)}')
+        parts.append(f'lmin{spec.sys_ell_min}')
+        if spec.sys_spec_type == 'delta':
+            parts.append(f'ldelta{spec.sys_ell_delta}')
+        else:
+            parts.append(f'lmax{spec.sys_ell_max}')
     if spec.redshift_sel:
         parts.append(f'z{_slug_number(spec.zmin)}-{_slug_number(spec.zmax)}')
     if spec.replicate:
@@ -333,8 +349,144 @@ def _apply_stellar_systematic(spec: ExperimentSpec, catalog: PreparedCatalog, mo
     return catalog
 
 
+def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+    seeds = _stage_seeds(spec, mock_idx)
+    periodic = (spec.mock_type == 'quijote')
+    boxsize_use = catalog.metadata.get('boxsize_use', spec.boxsize)
+
+    sys_map = gen_controlled_transverse_map(
+        amp=spec.sys_amp,
+        nside=256,
+        seed=seeds['dust'],
+        spec_type=spec.sys_spec_type,
+        ell_max=spec.sys_ell_max,
+        ell_min=spec.sys_ell_min,
+        ell_delta=spec.sys_ell_delta,
+        periodic=periodic,
+        boxsize=boxsize_use,
+    )
+
+    n_gal = catalog.positions_rdd.shape[1]
+    rng = np.random.default_rng(seeds['stellar_map'])
+
+    if not periodic:
+        # HEALPix path: Poisson-sample from positive lobe of full-sky map
+        nside_map = hp.npix2nside(len(sys_map))
+        positive_map = np.clip(sys_map, 0.0, None)
+        total_weight = positive_map.sum()
+        if total_weight > 0:
+            n_inject = max(1, int(spec.sys_amp * n_gal))
+            expected_counts = positive_map / total_weight * n_inject
+            ra_inject, dec_inject = generate_poisson_radec_from_map(
+                expected_counts, seed=seeds['stellar_radec']
+            )
+        else:
+            ra_inject, dec_inject = np.array([]), np.array([])
+    else:
+        # Periodic 2D FFT path: sample positions uniformly in transverse plane,
+        # then accept/reject with probability proportional to positive part of map.
+        # This preserves periodicity: the injection density is periodic in (x,y).
+        ngrid = sys_map.shape[0]
+        positive_map = np.clip(sys_map, 0.0, None)
+        max_val = positive_map.max()
+        if max_val <= 0:
+            ra_inject, dec_inject = np.array([]), np.array([])
+        else:
+            n_inject = max(1, int(spec.sys_amp * n_gal))
+            # Rejection-sample uniform (x,y) with envelope = max_val
+            accepted_xy = []
+            batch = n_inject * 4
+            while len(accepted_xy) < n_inject:
+                xs = rng.uniform(0.0, boxsize_use, size=batch)
+                ys = rng.uniform(0.0, boxsize_use, size=batch)
+                ix = np.floor(xs / boxsize_use * ngrid).astype(int) % ngrid
+                iy = np.floor(ys / boxsize_use * ngrid).astype(int) % ngrid
+                vals = positive_map[ix, iy]
+                u = rng.uniform(0.0, max_val, size=batch)
+                keep = u < vals
+                accepted_xy.extend(zip(xs[keep], ys[keep]))
+            accepted_xy = accepted_xy[:n_inject]
+            xs_inj = np.array([p[0] for p in accepted_xy])
+            ys_inj = np.array([p[1] for p in accepted_xy])
+            # Convert (x, y) in Cartesian box coords to (RA, Dec)
+            # The box z-axis is the LOS; x and y are transverse.
+            # Place injected galaxies at box center in z, sample r from catalog.
+            z_inj = np.full(n_inject, boxsize_use / 2.0)
+            galpos_inj = np.stack([xs_inj, ys_inj, z_inj], axis=1)
+            ra_inject, dec_inject, _ = convert_to_ra_dec_distance(galpos_inj, boxsize_use)
+
+    if len(ra_inject) == 0:
+        catalog.metadata['transverse_additive_injected'] = 0
+        return catalog
+
+    rng2 = np.random.default_rng(seeds['stellar_redshift'])
+    rand_idx = rng2.choice(len(catalog.base_r), size=len(ra_inject), replace=True)
+    r_inject = catalog.base_r[rand_idx]
+
+    inject_positions = np.vstack([ra_inject, dec_inject, r_inject])
+    inject_weights = np.ones(len(ra_inject), dtype=float)
+    catalog.positions_rdd = np.concatenate([catalog.positions_rdd, inject_positions], axis=1)
+    catalog.weights = np.concatenate([catalog.weights, inject_weights])
+    catalog.metadata['transverse_additive_injected'] = len(ra_inject)
+    return catalog
+
+
+def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+    seeds = _stage_seeds(spec, mock_idx)
+    periodic = (spec.mock_type == 'quijote')
+    boxsize_use = catalog.metadata.get('boxsize_use', spec.boxsize)
+
+    sys_map = gen_controlled_transverse_map(
+        amp=spec.sys_amp,
+        nside=256,
+        seed=seeds['dust'],
+        spec_type=spec.sys_spec_type,
+        ell_max=spec.sys_ell_max,
+        ell_min=spec.sys_ell_min,
+        ell_delta=spec.sys_ell_delta,
+        periodic=periodic,
+        boxsize=boxsize_use,
+    )
+
+    ra = catalog.positions_rdd[0]
+    dec = catalog.positions_rdd[1]
+
+    if not periodic:
+        # HEALPix map: use existing modify_fkp_weights (samples by RA/Dec)
+        nside_map = hp.npix2nside(len(sys_map))
+        weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
+    else:
+        # 2D periodic map: sample by Cartesian (x, y) transverse position.
+        # catalog positions are already in (RA, Dec, r) form; we recover transverse
+        # Cartesian coords by reversing the box projection used during catalog prep.
+        ngrid = sys_map.shape[0]
+        # Convert RA/Dec back to Cartesian box transverse coords
+        # RA in [0,360) maps to x in [0, boxsize), Dec in [~-45,~45] maps to y.
+        # The exact mapping depends on convert_to_ra_dec_distance; we reproduce it:
+        #   ra  = atan2(y - L/2, x - L/2) in degrees (plus offset)
+        #   dec = asin(z_normalized) ... but here z is LOS, not the third Cartesian axis.
+        # Simplest robust approach: treat RA/Dec as angular coords of a 2D map
+        # evaluated in the periodic box frame by wrapping.
+        # Map RA [0,360) -> x index, Dec angle -> y index via linear wrap.
+        x_frac = (ra % 360.0) / 360.0
+        # Dec ranges approximately over the angular size of the box; wrap to [0,1)
+        dec_range = np.degrees(np.arctan(boxsize_use / 2.0 / (boxsize_use / 2.0)))  # ~45 deg
+        y_frac = ((dec + dec_range) / (2 * dec_range)) % 1.0
+        ix = np.floor(x_frac * ngrid).astype(int) % ngrid
+        iy = np.floor(y_frac * ngrid).astype(int) % ngrid
+        dn_over_n = sys_map[ix, iy]
+        w_sys = np.clip(1.0 + dn_over_n, 0.01, 10.0)
+        weights = catalog.weights * w_sys
+        sys_weights = w_sys
+
+    catalog.weights = weights
+    catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
+    return catalog
+
+
 def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
-    if spec.contamination_mode not in {'none', 'stellar', 'dust', 'both'}:
+    valid_modes = {'none', 'stellar', 'dust', 'both', 'transverse_additive', 'transverse_multiplicative'}
+    if spec.contamination_mode not in valid_modes:
         raise ValueError(f'Unknown contamination_mode: {spec.contamination_mode}')
 
     if spec.contamination_mode in {'dust', 'both'}:
@@ -342,6 +494,12 @@ def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_id
 
     if spec.contamination_mode in {'stellar', 'both'}:
         catalog = _apply_stellar_systematic(spec, catalog, mock_idx)
+
+    if spec.contamination_mode == 'transverse_additive':
+        catalog = _apply_transverse_additive_sys(spec, catalog, mock_idx)
+
+    if spec.contamination_mode == 'transverse_multiplicative':
+        catalog = _apply_transverse_multiplicative_sys(spec, catalog, mock_idx)
 
     return catalog
 

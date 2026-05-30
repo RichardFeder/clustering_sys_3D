@@ -265,6 +265,131 @@ def gen_dn_n_map(cl_sfd=None, grf_map=None, alpha=-10, std=0.01, seed=None):
     return dn_n
 
 
+def gen_controlled_transverse_map(amp, nside=256, seed=None, spec_type='power_law',
+                                   ell_max=64, ell_min=6, ell_delta=None,
+                                   periodic=False, boxsize=1000.0, ngrid=256):
+    """
+    Generate a controlled transverse-only systematic map as a Gaussian Random Field.
+
+    For lightcone geometry (periodic=False), generates a HEALPix GRF using hp.synfast.
+    For periodic box geometry (periodic=True), generates a 2D FFT-based map that is
+    periodic in the transverse plane, avoiding boundary artifacts that would break the
+    periodicity assumption and introduce fictitious power.
+
+    Parameters
+    ----------
+    amp : float
+        Target rms amplitude (std) of the output map.
+    nside : int
+        HEALPix resolution for lightcone mode.
+    seed : int or None
+        Random seed for reproducibility.
+    spec_type : str
+        Angular/transverse power spectrum shape:
+        - 'flat'       : C_ell = const (white noise in angular modes)
+        - 'power_law'  : C_ell propto 1/ell^2 (approximates stars/dust)
+        - 'delta'      : C_ell = 1 at ell=ell_delta only; requires ell_delta to be set
+    ell_max : int
+        Maximum angular multipole (or k-mode) with power. Modes above this are zero.
+    ell_min : int
+        Minimum angular multipole (or k-mode) with power. For Quijote boxes,
+        set to ~k_min_box * chi_eff (typically ~6); for lightcones, use 2-3.
+    ell_delta : int or None
+        For spec_type='delta': the single multipole to inject power at.
+    periodic : bool
+        If True, generate a 2D FFT-based periodic transverse map (for periodic boxes).
+        If False, generate a HEALPix full-sky map (for lightcones).
+    boxsize : float
+        Box side length in Mpc/h. Only used when periodic=True.
+    ngrid : int
+        Number of grid cells per transverse dimension for FFT synthesis. Only used
+        when periodic=True.
+
+    Returns
+    -------
+    map_out : ndarray
+        If periodic=False: HEALPix map, shape (hp.nside2npix(nside),).
+        If periodic=True: 2D periodic map, shape (ngrid, ngrid), in box coordinates
+            where each axis spans [0, boxsize).
+    """
+    if spec_type == 'delta' and ell_delta is None:
+        raise ValueError("spec_type='delta' requires ell_delta to be set.")
+
+    rng = np.random.default_rng(seed)
+
+    if not periodic:
+        # --- HEALPix synthesis for lightcones ---
+        lmax = 3 * nside - 1
+        ells = np.arange(lmax + 1, dtype=float)
+        cl = np.zeros(lmax + 1)
+
+        if spec_type == 'flat':
+            mask = (ells >= ell_min) & (ells <= ell_max)
+            cl[mask] = 1.0
+        elif spec_type == 'power_law':
+            mask = (ells >= max(ell_min, 1)) & (ells <= ell_max)
+            cl[mask] = 1.0 / ells[mask] ** 2
+        elif spec_type == 'delta':
+            if ell_min <= ell_delta <= min(ell_max, lmax):
+                cl[ell_delta] = 1.0
+        else:
+            raise ValueError(f"Unknown spec_type='{spec_type}'. Use 'flat', 'power_law', or 'delta'.")
+
+        # hp.synfast uses the global numpy RNG; seed via legacy interface
+        np_state = np.random.get_state()
+        np.random.seed(rng.integers(0, 2**31 - 1))
+        map_out = hp.synfast(cl, nside=nside, lmax=lmax, new=True)
+        np.random.set_state(np_state)
+
+    else:
+        # --- 2D FFT synthesis for periodic boxes ---
+        # Build 2D k-grid (units: 2pi/boxsize * integer)
+        k_fund = 2.0 * np.pi / boxsize
+        kfreqs = np.fft.fftfreq(ngrid, d=1.0 / ngrid)  # integer mode numbers
+        kx, ky = np.meshgrid(kfreqs, kfreqs, indexing='ij')
+        k_mag = np.sqrt(kx ** 2 + ky ** 2)  # in units of fundamental mode number
+
+        # Build 2D power spectrum using mode numbers (analogous to ell)
+        pk2d = np.zeros((ngrid, ngrid))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            if spec_type == 'flat':
+                pk2d = np.where((k_mag >= ell_min) & (k_mag <= ell_max), 1.0, 0.0)
+            elif spec_type == 'power_law':
+                pk2d = np.where(
+                    (k_mag >= max(ell_min, 1)) & (k_mag <= ell_max),
+                    1.0 / k_mag ** 2,
+                    0.0,
+                )
+                pk2d[0, 0] = 0.0  # zero DC mode
+            elif spec_type == 'delta':
+                # Annular shell: modes within 0.5 of ell_delta
+                pk2d = np.where(np.abs(k_mag - ell_delta) < 0.5, 1.0, 0.0)
+            else:
+                raise ValueError(f"Unknown spec_type='{spec_type}'. Use 'flat', 'power_law', or 'delta'.")
+
+        # Sample complex Gaussian amplitudes with variance proportional to pk2d
+        # Use proper Hermitian symmetry so IFFT produces a real field
+        noise_re = rng.standard_normal((ngrid, ngrid))
+        noise_im = rng.standard_normal((ngrid, ngrid))
+        amp_grid = np.sqrt(pk2d) * (noise_re + 1j * noise_im)
+
+        # Enforce Hermitian symmetry: field_k[-kx,-ky] = conj(field_k[kx,ky])
+        amp_grid = np.fft.ifftshift(
+            0.5 * (np.fft.ifftshift(amp_grid) + np.conj(np.fft.ifftshift(amp_grid)[::-1, ::-1]))
+        )
+        amp_grid[0, 0] = 0.0  # zero mean
+
+        map_out = np.fft.ifft2(amp_grid).real
+
+    # Normalize to requested rms amplitude
+    map_out -= np.mean(map_out)
+    std = np.std(map_out)
+    if std > 0:
+        map_out *= amp / std
+
+    return map_out
+
+
 def modify_fkp_weights(ra, dec, w_fkp, delta_n_over_n_map, nside=256):
     """
     Modulate FKP weights using a contamination map (delta_n_over_n).
