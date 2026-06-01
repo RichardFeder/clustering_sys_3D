@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import healpy as hp
 from astropy.cosmology import Planck18 as cosmo
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
 from nonunif_binning import compute_null_bins
 
@@ -33,6 +35,18 @@ from utils import (
 
 DEFAULT_QUIJOTE_BASEDIR = '/global/cfs/cdirs/desi/users/rmfeder/quijote/fiducial/systematics/'
 DEFAULT_HALFDOME_BASEDIR = '/global/cfs/cdirs/cmb/gsharing/halfdome/full_res/halos/'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Contamination map cache: stores computed sys_maps by (spec_label, mock_idx)
+# to avoid recomputing the same field for each mode (additive, multiplicative).
+# ─────────────────────────────────────────────────────────────────────────────
+_contamination_map_cache: dict[tuple[str, int], np.ndarray] = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gaia HEALPix mask cache: stores the extragalactic Gaia coverage mask by mock_idx.
+# The mask is a HEALPix array where True = coverage (counts > 0), False = no coverage.
+# ─────────────────────────────────────────────────────────────────────────────
+_gaia_healpix_mask_cache: dict[int, np.ndarray] = {}
 
 
 @dataclass(frozen=True)
@@ -73,12 +87,39 @@ class ExperimentSpec:
     quijote_basedir: str = DEFAULT_QUIJOTE_BASEDIR
     halfdome_basedir: str = DEFAULT_HALFDOME_BASEDIR
     quijote_geometry: str = 'replicated'
+    # Power spectrum line-of-sight direction
+    # 'z': plane-parallel along z-axis (correct for Quijote periodic boxes)
+    # 'endpoint': per-galaxy LOS vector from observer (correct for wide-angle lightcones like Halfdome)
+    los: str = 'z'
+    # Target comoving number density for downsampling (h/Mpc)^3.
+    # If None, no nbar-based downsampling is applied (use n_sample instead).
+    target_nbar: float | None = None
     # Controlled transverse systematic parameters
     sys_amp: float = 0.01
     sys_spec_type: str = 'power_law'
     sys_ell_min: int = 6
     sys_ell_max: int = 64
     sys_ell_delta: int | None = None
+    # For gaia_stellar spec_type: 'rms'=scale to RMS amplitude (default),
+    # 'mean'=scale to mean value (contamination fraction)
+    sys_amp_mode: str = 'rms'
+    # Mean-conserving additive injection: in negative-lobe pixels, *remove*
+    # existing galaxies (probabilistically) in addition to adding sources in
+    # positive lobes. Preserves total n_gal and the input angular C_l (no
+    # clipped-Gaussian distortion). When False, falls back to one-sided
+    # positive-lobe-only Poisson injection (legacy behavior; biases n_gal by
+    # +sys_amp and distorts the angular spectrum).
+    mean_conserving_additive: bool = True
+    # Debug: also apply the multiplicative w_sys to randoms. If True, an
+    # unbiased estimator must yield ratio P_contam/P_clean ≈ 1 at all (k, mu).
+    # Used to disentangle "real" injected systematic power from estimator-level
+    # window-leakage / radial-projection effects.
+    apply_sys_to_randoms: bool = False
+    # Galactic latitude cut (degrees). When > 0, galaxies with |b| < gal_lat_cut_deg
+    # are removed from both data and randoms, and the contamination map is zeroed
+    # in the same region. Applied uniformly to clean and contaminated catalogs so
+    # the ratio P_contam/P_clean is not affected by the Galactic-plane mask.
+    gal_lat_cut_deg: float = 0.0
 
 
 @dataclass
@@ -207,6 +248,9 @@ def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
         'nmesh': 512,
         'seed': 42,
         'quijote_geometry': 'full_cube' if mock_type_norm == 'quijote' else 'replicated',
+        # Global plane-parallel LOS ('z') for both mock types.
+        # Wedges are recovered analytically from multipoles via _poles_to_wedges.
+        'los': 'z',
     }
 
 
@@ -219,6 +263,22 @@ def append_run_ledger(save_dir: str, entry: dict[str, Any]) -> str:
 
 
 def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> dict[str, int]:
+    """Return per-stage deterministic seeds derived from spec.seed and mock_idx.
+
+    Each pipeline stage draws from its own independent RNG stream so that
+    changing one stage (e.g. the dust seed) does not perturb the randoms or
+    the stellar injection.  Seeds are offset by 10_000 * mock_idx so that
+    different mock realizations never share a sub-stream.
+
+    Keys
+    ----
+    quijote      : galaxy position loading / Halfdome subsampling
+    dust         : delta-E(B-V) GRF synthesis + transverse map synthesis
+    stellar_map  : Poisson star-count draw from stellar density map
+    stellar_radec: angular position sampling within pixels (and injection add step)
+    stellar_redshift: radial distance resampling for injected sources
+    randoms      : uniform random catalog generation
+    """
     base = int(spec.seed) + mock_idx * 10_000
     return {
         'quijote': base + 1,
@@ -230,7 +290,54 @@ def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> dict[str, int]:
     }
 
 
+def _load_or_compute_gaia_healpix_mask(mock_idx: int) -> np.ndarray:
+    """
+    Load or compute the Gaia extragalactic coverage mask as a HEALPix array.
+    
+    The mask is True (1) where stellar_counts > 0 (survey has coverage),
+    and False (0) where stellar_counts == 0 (no coverage).
+    
+    This mask is cached by mock_idx to avoid recomputing for each contamination mode.
+    
+    Returns
+    -------
+    mask : np.ndarray (HEALPix boolean array)
+        True where coverage exists, False where no coverage.
+    """
+    if mock_idx in _gaia_healpix_mask_cache:
+        return _gaia_healpix_mask_cache[mock_idx]
+    
+    # Load the stellar density map (same for all mocks)
+    stellar_map = load_gaia_stellar_density(plot=False)
+    
+    # Create binary mask: True where stellar counts > 0
+    mask = (stellar_map > 0).astype(bool)
+    
+    # Cache and return
+    _gaia_healpix_mask_cache[mock_idx] = mask
+    return mask
+
+
 def _prepare_quijote_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock) -> PreparedCatalog:
+    """Load and pre-process a Quijote periodic-box mock into a PreparedCatalog.
+
+    Steps
+    -----
+    1. Load halo positions from the Quijote snapshot at mock_idx (optionally
+       with RSD displacement along the z-axis).
+    2. Down-sample by spec.ds_fac (default 5), or replicate the box by
+       spec.rep_fac if spec.replicate is True.
+    3. Convert Cartesian (x, y, z) ∈ [0, L]^3 to (RA, Dec, r) with the
+       observer placed at the box centre (L/2, L/2, L/2).
+    4. If spec.redshift_sel is True, compute a comoving-distance → redshift
+       mapping via a Planck18 interpolator and store in base_redshifts so
+       the redshift window [zmin, zmax] can be applied upstream in
+       run_single_experiment.  Without replication the Quijote box at
+       ds_fac=5 typically yields ~10^5 galaxies after the z-window cut.
+
+    The periodic geometry means no angular footprint mask is needed; the
+    full survey volume is the box itself.
+    """
     if not spec.quijote_basedir.endswith('/'):
         quijote_basedir = spec.quijote_basedir + '/'
     else:
@@ -249,25 +356,95 @@ def _prepare_quijote_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock)
     )
 
     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
-    center_offset_mpc = None
-    ra, dec, r = convert_to_ra_dec_distance(galpos, boxsize_use, center_offset_mpc=center_offset_mpc)
-    r_values = np.asarray(r.value if hasattr(r, 'value') else r)
-    positions_rdd = np.vstack([ra, dec, r_values])
-    weights = np.ones_like(ra, dtype=float)
+    
+    # For periodic box, keep positions in Cartesian coordinates (x, y, z)
+    # This ensures los='z' in CatalogFFTPower correctly refers to the box z-axis
+    positions_rdd = galpos.T
+    weights = np.ones_like(positions_rdd, dtype=float)
+    base_r = galpos[2]  # z-coordinate as the radial/depth coordinate
 
+    # For periodic box, no redshift_sel is applied (the z-coordinate IS the radial coordinate)
     base_redshifts = None
-    if spec.redshift_sel:
-        dcom_to_z_interp = gen_interp_fn_dcom_z()
-        base_redshifts = comoving_distance_to_redshift(r_values / cosmo.h, dcom_to_z_interp)
+
+    print("prepared catalog positions has shape", positions_rdd.shape)
+    print('weights have shape', weights.shape)
 
     return PreparedCatalog(
         positions_rdd=positions_rdd,
         weights=weights,
         base_redshifts=base_redshifts,
-        base_r=r_values,
+        base_r=base_r,
         mock_idx=mock_idx,
         metadata={'boxsize_use': boxsize_use, 'quijote_basedir': quijote_basedir},
     )
+
+
+def _gal_lat_b(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
+    """Return galactic latitude b (degrees) for equatorial RA/Dec arrays."""
+    c = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame='icrs')
+    return c.galactic.b.deg
+
+
+def _apply_gal_lat_cut(catalog: PreparedCatalog, cut_deg: float) -> PreparedCatalog:
+    """Remove catalog entries with |b| < cut_deg. Applied to data before contamination
+    injection so both clean and contaminated catalogs share the same angular footprint."""
+    if cut_deg <= 0.0:
+        return catalog
+    ra  = catalog.positions_rdd[0]
+    dec = catalog.positions_rdd[1]
+    b   = _gal_lat_b(ra, dec)
+    keep = np.abs(b) >= cut_deg
+    catalog.positions_rdd    = catalog.positions_rdd[:, keep]
+    catalog.weights          = catalog.weights[keep]
+    catalog.base_r           = catalog.base_r[keep]
+    if catalog.base_redshifts is not None:
+        catalog.base_redshifts = catalog.base_redshifts[keep]
+    return catalog
+
+
+def _apply_healpix_mask_to_catalog(catalog: PreparedCatalog, mask: np.ndarray, nside: int | None = None) -> PreparedCatalog:
+    """Apply a HEALPix binary mask to the catalog. Removes catalog entries in masked (False) pixels.
+    
+    Parameters
+    ----------
+    catalog : PreparedCatalog
+        Input catalog to mask.
+    mask : np.ndarray
+        HEALPix binary mask (True = keep, False = masked out).
+    nside : int, optional
+        HEALPix nside. If None, inferred from mask length.
+    
+    Returns
+    -------
+    catalog : PreparedCatalog
+        Masked catalog with entries in masked regions removed.
+    """
+    if mask is None or np.all(mask):
+        return catalog  # No masking needed
+    
+    if nside is None:
+        nside = hp.npix2nside(len(mask))
+    
+    ra  = catalog.positions_rdd[0]
+    dec = catalog.positions_rdd[1]
+    theta = np.radians(90.0 - dec)
+    phi = np.radians(ra)
+    pix = hp.ang2pix(nside, theta, phi, nest=False)
+    
+    # Keep entries where mask is True
+    keep = mask[pix]
+    n_before = catalog.positions_rdd.shape[1]
+    
+    catalog.positions_rdd = catalog.positions_rdd[:, keep]
+    catalog.weights = catalog.weights[keep]
+    catalog.base_r = catalog.base_r[keep]
+    if catalog.base_redshifts is not None:
+        catalog.base_redshifts = catalog.base_redshifts[keep]
+    
+    n_after = catalog.positions_rdd.shape[1]
+    print(f'  Gaia coverage mask applied: {n_before:,} → {n_after:,} galaxies')
+    
+    return catalog
 
 
 def _prepare_halfdome_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock) -> PreparedCatalog:
@@ -277,7 +454,10 @@ def _prepare_halfdome_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock
         halfdome_basedir = spec.halfdome_basedir
 
     dm.halfdome_mock_basedir = halfdome_basedir
-    galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=spec.n_sample)
+    
+    # Use seeded sampling for reproducible galaxy subsampling
+    seeds = _stage_seeds(spec, mock_idx)
+    galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=spec.n_sample, seed=seeds['quijote'])
 
     ra, dec, r = convert_to_ra_dec_distance(galpos, spec.boxsize, center_offset_mpc=0.0)
     r_values = np.asarray(r.value if hasattr(r, 'value') else r)
@@ -349,29 +529,155 @@ def _apply_stellar_systematic(spec: ExperimentSpec, catalog: PreparedCatalog, mo
     return catalog
 
 
-def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+def _get_or_compute_contamination_map(
+    spec: ExperimentSpec, 
+    mock_idx: int, 
+    catalog: PreparedCatalog,
+) -> np.ndarray:
+    """
+    Get or compute the transverse contamination map, using a cache to avoid
+    recomputation when the same map is needed for multiple contamination modes.
+    
+    The map is cached by (spec_label, mock_idx) so it is computed once per
+    mock_idx and reused for both additive and multiplicative modes.
+    
+    Reproducibility: The map is always computed with the same seed for a given
+    (spec, mock_idx) pair, so the same field is generated every time. All RNG
+    operations throughout the pipeline use deterministic seeds derived from
+    spec.seed and mock_idx via _stage_seeds(), ensuring full reproducibility.
+    """
+    label = build_run_label(spec)
+    cache_key = (label, mock_idx)
+    
+    # Return cached map if available
+    if cache_key in _contamination_map_cache:
+        return _contamination_map_cache[cache_key]
+    
+    # Otherwise, generate and cache it
     seeds = _stage_seeds(spec, mock_idx)
     periodic = (spec.mock_type == 'quijote')
     boxsize_use = catalog.metadata.get('boxsize_use', spec.boxsize)
 
-    sys_map = gen_controlled_transverse_map(
-        amp=spec.sys_amp,
-        nside=256,
-        seed=seeds['dust'],
-        spec_type=spec.sys_spec_type,
-        ell_max=spec.sys_ell_max,
-        ell_min=spec.sys_ell_min,
-        ell_delta=spec.sys_ell_delta,
-        periodic=periodic,
-        boxsize=boxsize_use,
-    )
+    if spec.sys_spec_type == 'gaia_stellar':
+        # Build a δn/n template from the Gaia stellar density map, normalized
+        # to have RMS = spec.sys_amp or mean = spec.sys_amp depending on sys_amp_mode.
+        # This lets us apply the SAME anisotropic angular template as both additive
+        # and multiplicative contamination so we can directly compare their μ-dependence.
+        #
+        # Note: The Gaia extragalactic coverage mask has already been applied to the
+        # data catalog early in run_single_experiment(). Here we just normalize the
+        # stellar map (preserving its inherent Gaia zeros) to the target amplitude.
+        stellar_map = load_gaia_stellar_density(plot=False)
+        m = stellar_map.astype(float)
+        
+        # Identify regions with Gaia coverage (counts > 0) for normalization
+        gaia_coverage = (stellar_map > 0)
+        unmasked = m[gaia_coverage]
+        
+        # Apply galactic latitude masking if requested (for the map itself, not the data)
+        mask_pixels = ~gaia_coverage.copy()
+        if spec.gal_lat_cut_deg > 0.0:
+            nside_m = hp.npix2nside(len(m))
+            pix_idx = np.arange(len(m))
+            pix_theta, pix_phi = hp.pix2ang(nside_m, pix_idx)
+            pix_ra  = np.degrees(pix_phi)
+            pix_dec = 90.0 - np.degrees(pix_theta)
+            pix_b   = _gal_lat_b(pix_ra, pix_dec)
+            plane_mask = np.abs(pix_b) < spec.gal_lat_cut_deg
+            mask_pixels |= plane_mask  # Add galactic plane to masked region
+            unmasked = m[~mask_pixels]  # Recompute unmasked after plane cut
+        
+        # Normalize the map to target amplitude (using only unmasked regions for statistics)
+        if spec.sys_amp_mode == 'mean':
+            current_mean = unmasked.mean()
+            if abs(current_mean) > 1e-10:
+                sys_map = (spec.sys_amp / current_mean) * m
+            else:
+                sys_map = m
+        else:  # 'rms' mode (default)
+            m_centered = m - unmasked.mean()
+            std = m_centered[~mask_pixels].std()
+            if std > 0:
+                sys_map = (spec.sys_amp / std) * m_centered
+            else:
+                sys_map = m_centered
+        
+        # Zero out masked regions (Gaia no-coverage + galactic plane)
+        sys_map[mask_pixels] = 0.0
+    else:
+        sys_map = gen_controlled_transverse_map(
+            amp=spec.sys_amp,
+            nside=256,
+            seed=seeds['dust'],
+            spec_type=spec.sys_spec_type,
+            ell_max=spec.sys_ell_max,
+            ell_min=spec.sys_ell_min,
+            ell_delta=spec.sys_ell_delta,
+            periodic=periodic,
+            boxsize=boxsize_use,
+        )
+
+    _contamination_map_cache[cache_key] = sys_map
+    return sys_map
+
+
+def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+    seeds = _stage_seeds(spec, mock_idx)
+    periodic = (spec.mock_type == 'quijote')
+    boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
+    
+    # Use cached contamination map (computed once per mock_idx, reused across modes)
+    sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
 
     n_gal = catalog.positions_rdd.shape[1]
     rng = np.random.default_rng(seeds['stellar_map'])
 
     if not periodic:
-        # HEALPix path: Poisson-sample from positive lobe of full-sky map
-        nside_map = hp.npix2nside(len(sys_map))
+        # HEALPix path
+        # nside_map = hp.npix2nside(len(sys_map))
+        # npix = len(sys_map)
+
+        # if spec.mean_conserving_additive:
+        #     # ─── Mean-conserving injection ──────────────────────────────
+        #     # Realize δn(p) = n_per_pix × sys_map(p) as a Poisson process:
+        #     #   * In positive-lobe pixels: ADD sources with rate
+        #     #         λ_add(p) = n_per_pix × sys_map(p)
+        #     #   * In negative-lobe pixels: REMOVE existing galaxies with
+        #     #         p_rem(p) = |sys_map(p)|  (≤ 1 for sys_amp ≪ 1)
+        #     # Net <ΔN> = 0; angular density modulation = sys_map; no
+        #     # clipped-Gaussian distortion of the input angular spectrum.
+        #     n_per_pix = n_gal / npix
+        #     positive_part = np.clip(sys_map, 0.0, None)
+        #     negative_part = np.clip(-sys_map, 0.0, None)
+
+        #     # ADD step
+        #     expected_counts_add = n_per_pix * positive_part
+        #     if expected_counts_add.sum() > 0:
+        #         ra_inject, dec_inject = generate_poisson_radec_from_map(
+        #             expected_counts_add, seed=seeds['stellar_radec']
+        #         )
+        #     else:
+        #         ra_inject, dec_inject = np.array([]), np.array([])
+
+        #     # REMOVE step (operates on the existing catalog FIRST so that
+        #     # any base_r resampling below draws from the surviving sources).
+        #     theta_gal = np.radians(90.0 - catalog.positions_rdd[1])
+        #     phi_gal = np.radians(catalog.positions_rdd[0])
+        #     pix_gal = hp.ang2pix(nside_map, theta_gal, phi_gal)
+        #     p_remove = np.clip(negative_part[pix_gal], 0.0, 1.0)
+        #     rng_rem = np.random.default_rng(int(seeds['stellar_radec']) + 1)
+        #     keep_mask = rng_rem.uniform(0.0, 1.0, size=p_remove.shape) >= p_remove
+        #     n_removed = int((~keep_mask).sum())
+        #     if n_removed > 0:
+        #         catalog.positions_rdd = catalog.positions_rdd[:, keep_mask]
+        #         catalog.weights = catalog.weights[keep_mask]
+        #         if catalog.base_redshifts is not None:
+        #             catalog.base_redshifts = catalog.base_redshifts[keep_mask]
+        #         if catalog.base_r is not None:
+        #             catalog.base_r = catalog.base_r[keep_mask]
+        #     catalog.metadata['transverse_additive_removed'] = n_removed
+        # else:
+        # Legacy one-sided positive-lobe injection (biases n_gal upward)
         positive_map = np.clip(sys_map, 0.0, None)
         total_weight = positive_map.sum()
         if total_weight > 0:
@@ -408,45 +714,46 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
             accepted_xy = accepted_xy[:n_inject]
             xs_inj = np.array([p[0] for p in accepted_xy])
             ys_inj = np.array([p[1] for p in accepted_xy])
-            # Convert (x, y) in Cartesian box coords to (RA, Dec)
-            # The box z-axis is the LOS; x and y are transverse.
-            # Place injected galaxies at box center in z, sample r from catalog.
-            z_inj = np.full(n_inject, boxsize_use / 2.0)
-            galpos_inj = np.stack([xs_inj, ys_inj, z_inj], axis=1)
-            ra_inject, dec_inject, _ = convert_to_ra_dec_distance(galpos_inj, boxsize_use)
+            # Convert transverse (x,y) to RA/Dec only; use a dummy z for the
+            # coordinate conversion (r will be resampled from catalog.base_r below).
+            zs_dummy = np.full(n_inject, boxsize_use / 2.0)
+            galpos_inj = np.stack([xs_inj, ys_inj, zs_dummy], axis=1)
+            # ra_inject, dec_inject, _ = convert_to_ra_dec_distance(galpos_inj, boxsize_use)
 
-    if len(ra_inject) == 0:
-        catalog.metadata['transverse_additive_injected'] = 0
-        return catalog
+    # if len(ra_inject) == 0:
+    #     catalog.metadata['transverse_additive_injected'] = 0
+    #     return catalog
 
-    rng2 = np.random.default_rng(seeds['stellar_redshift'])
-    rand_idx = rng2.choice(len(catalog.base_r), size=len(ra_inject), replace=True)
-    r_inject = catalog.base_r[rand_idx]
+    # Draw radial distances from the (already redshift-selected) catalog so
+    # injected sources occupy the same radial shell as the true galaxies.
+    # rng2 = np.random.default_rng(seeds['stellar_redshift'])
+    # rand_idx = rng2.choice(len(catalog.base_r), size=len(ra_inject), replace=True)
+    # r_inject = catalog.base_r[rand_idx]
 
-    inject_positions = np.vstack([ra_inject, dec_inject, r_inject])
-    inject_weights = np.ones(len(ra_inject), dtype=float)
-    catalog.positions_rdd = np.concatenate([catalog.positions_rdd, inject_positions], axis=1)
-    catalog.weights = np.concatenate([catalog.weights, inject_weights])
-    catalog.metadata['transverse_additive_injected'] = len(ra_inject)
+    # inject_positions = np.vstack([ra_inject, dec_inject, r_inject])
+    inject_weights = np.ones_like(galpos_inj, dtype=float)
+
+    print('positions rdd has shape', catalog.positions_rdd.shape)
+    print('inject positions has shape', galpos_inj.shape)
+
+    catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj.T], axis=1)
+
+    print("catalog.positions_rdd now has shape ", catalog.positions_rdd.shape)
+
+    print('catalog.weights has shpae', catalog.weights.shape)
+
+    catalog.weights = np.concatenate([catalog.weights, inject_weights.T], axis=1)
+    # catalog.metadata['transverse_additive_injected'] = len(xs_inj)
     return catalog
 
 
 def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
     seeds = _stage_seeds(spec, mock_idx)
     periodic = (spec.mock_type == 'quijote')
-    boxsize_use = catalog.metadata.get('boxsize_use', spec.boxsize)
-
-    sys_map = gen_controlled_transverse_map(
-        amp=spec.sys_amp,
-        nside=256,
-        seed=seeds['dust'],
-        spec_type=spec.sys_spec_type,
-        ell_max=spec.sys_ell_max,
-        ell_min=spec.sys_ell_min,
-        ell_delta=spec.sys_ell_delta,
-        periodic=periodic,
-        boxsize=boxsize_use,
-    )
+    boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
+    
+    # Use cached contamination map (computed once per mock_idx, reused across modes)
+    sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
 
     ra = catalog.positions_rdd[0]
     dec = catalog.positions_rdd[1]
@@ -456,24 +763,20 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
         nside_map = hp.npix2nside(len(sys_map))
         weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
     else:
-        # 2D periodic map: sample by Cartesian (x, y) transverse position.
-        # catalog positions are already in (RA, Dec, r) form; we recover transverse
-        # Cartesian coords by reversing the box projection used during catalog prep.
-        ngrid = sys_map.shape[0]
-        # Convert RA/Dec back to Cartesian box transverse coords
-        # RA in [0,360) maps to x in [0, boxsize), Dec in [~-45,~45] maps to y.
-        # The exact mapping depends on convert_to_ra_dec_distance; we reproduce it:
-        #   ra  = atan2(y - L/2, x - L/2) in degrees (plus offset)
-        #   dec = asin(z_normalized) ... but here z is LOS, not the third Cartesian axis.
-        # Simplest robust approach: treat RA/Dec as angular coords of a 2D map
-        # evaluated in the periodic box frame by wrapping.
-        # Map RA [0,360) -> x index, Dec angle -> y index via linear wrap.
-        x_frac = (ra % 360.0) / 360.0
-        # Dec ranges approximately over the angular size of the box; wrap to [0,1)
-        dec_range = np.degrees(np.arctan(boxsize_use / 2.0 / (boxsize_use / 2.0)))  # ~45 deg
-        y_frac = ((dec + dec_range) / (2 * dec_range)) % 1.0
-        ix = np.floor(x_frac * ngrid).astype(int) % ngrid
-        iy = np.floor(y_frac * ngrid).astype(int) % ngrid
+        # Recover Cartesian (x, y) from (RA, Dec, r) by inverting
+        # convert_to_ra_dec_distance:
+        #   ra  = atan2(y - L/2, x - L/2)  →  x = r_perp*cos(ra) + L/2
+        #   dec = asin((z - L/2) / r)       →  y = r_perp*sin(ra) + L/2
+        # where r_perp = r * cos(dec) is the transverse distance.
+        r_vals = catalog.positions_rdd[2]
+        ra_rad  = np.radians(ra)
+        dec_rad = np.radians(dec)
+        r_perp  = r_vals * np.cos(dec_rad)
+        x_box   = r_perp * np.cos(ra_rad) + boxsize_use / 2.0
+        y_box   = r_perp * np.sin(ra_rad) + boxsize_use / 2.0
+        ngrid   = sys_map.shape[0]
+        ix = np.floor(x_box / boxsize_use * ngrid).astype(int) % ngrid
+        iy = np.floor(y_box / boxsize_use * ngrid).astype(int) % ngrid
         dn_over_n = sys_map[ix, iy]
         w_sys = np.clip(1.0 + dn_over_n, 0.01, 10.0)
         weights = catalog.weights * w_sys
@@ -481,6 +784,11 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
 
     catalog.weights = weights
     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
+    # Stash the input map + nside so _build_random_catalog can apply the
+    # same w_sys to randoms when spec.apply_sys_to_randoms is set.
+    catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
+    if not periodic:
+        catalog.metadata['transverse_multiplicative_nside'] = hp.npix2nside(len(sys_map))
     return catalog
 
 
@@ -504,6 +812,82 @@ def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_id
     return catalog
 
 
+def _generate_uniform_randoms_in_healpix_mask(
+    n_randoms: int, 
+    gaia_mask: np.ndarray, 
+    chi_interp,
+    z_source: np.ndarray,
+    seed: int = 42
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate random RA/Dec positions uniformly within a HEALPix mask region.
+    
+    This ensures the data/randoms ratio is maintained even when a mask removes
+    regions of the sky.
+    
+    Parameters
+    ----------
+    n_randoms : int
+        Number of random points to generate.
+    gaia_mask : np.ndarray
+        HEALPix mask (True = covered/keep, False = masked/skip).
+    chi_interp : callable
+        Comoving distance interpolator (z -> chi).
+    z_source : np.ndarray
+        Source redshift distribution to sample from.
+    seed : int
+        Random seed for reproducibility.
+    
+    Returns
+    -------
+    ra_rand, dec_rand, r_rand : np.ndarray
+        Random RA (degrees), Dec (degrees), r (Mpc/h) positions.
+    """
+    rng = np.random.default_rng(seed)
+    nside = hp.npix2nside(len(gaia_mask))
+    
+    # Get all pixels where mask is True (covered region)
+    covered_pixels = np.where(gaia_mask)[0]
+    if len(covered_pixels) == 0:
+        raise ValueError("Gaia mask has no covered pixels.")
+    
+    # Sample from the source z-distribution
+    z_indices = rng.choice(len(z_source), size=n_randoms, replace=True)
+    z_rand = z_source[z_indices]
+    
+    # Sample pixel indices from covered pixels for each random
+    pixel_indices = rng.choice(covered_pixels, size=n_randoms, replace=True)
+    
+    # For each pixel, generate RA/Dec uniformly within pixel bounds
+    # Get pixel centers and approximate sizes
+    lon_pix, lat_pix = hp.pix2ang(nside, pixel_indices, lonlat=True)  # (lon, lat) in degrees
+    
+    # Pixel angular size in degrees ~ sqrt(4π / N_pix) / sqrt(12)
+    pixel_area_sr = hp.nside2pixarea(nside)  # steradians
+    pixel_size_deg = np.degrees(np.sqrt(pixel_area_sr))  # approximate half-size
+    
+    # Generate RA/Dec uniformly around pixel centers
+    # Sample from uniform distribution in pixel's approximate bounding box
+    half_size = pixel_size_deg / 2.0
+    ra_offset = rng.uniform(-half_size, half_size, size=n_randoms)
+    dec_offset = rng.uniform(-half_size, half_size, size=n_randoms)
+    
+    ra_rand = lon_pix + ra_offset
+    dec_rand = lat_pix + dec_offset
+    
+    # Wrap RA to [0, 360)
+    ra_rand = ra_rand % 360.0
+    
+    # Clip Dec to [-90, 90]
+    dec_rand = np.clip(dec_rand, -90.0, 90.0)
+    
+    # Convert z to comoving distance
+    r_rand_mpc = chi_interp(z_rand)
+    r_rand = r_rand_mpc * cosmo.h  # Convert to Mpc/h
+    
+    return ra_rand, dec_rand, r_rand
+
+
 def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tuple[np.ndarray, np.ndarray]:
     seeds = _stage_seeds(spec, catalog.mock_idx)
     n_randoms = int(spec.n_random_factor * catalog.positions_rdd.shape[1])
@@ -511,22 +895,72 @@ def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tup
 
     if spec.redshift_sel:
         chi_interp = grab_chi_interp()
-        redshift_source = catalog.base_redshifts
+        
+        # Use original (pre-mask) z-distribution for randoms to maintain constant comoving density
+        redshift_source = catalog.metadata.get('original_base_redshifts')
+        if redshift_source is None:
+            # Fallback for non-gaia_stellar: use current (possibly masked) base_redshifts
+            redshift_source = catalog.base_redshifts
+        
         if redshift_source is None:
             raise ValueError('Redshift selection requested but no base redshifts were prepared.')
         if len(redshift_source) == 0:
             print('Warning: redshift-selected data is empty; falling back to uniform random z sampling in [zmin, zmax].')
             redshift_source = None
-        ra_rand, dec_rand, r_rand, _ = generate_uniform_randoms(
-            chi_interp,
-            n_randoms,
-            zmin=spec.zmin,
-            zmax=spec.zmax,
-            data_z=redshift_source,
-            seed=seeds['randoms'],
+        
+        # For Gaia stellar, generate randoms uniformly WITHIN the masked region
+        # This maintains the proper data/randoms ratio and avoids low-k power artifacts
+        if spec.sys_spec_type == 'gaia_stellar':
+            gaia_mask = catalog.metadata.get('gaia_coverage_mask')
+            if gaia_mask is not None and redshift_source is not None:
+                ra_rand, dec_rand, r_rand = _generate_uniform_randoms_in_healpix_mask(
+                    n_randoms,
+                    gaia_mask,
+                    chi_interp,
+                    redshift_source,
+                    seed=seeds['randoms'],
+                )
+                rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
+                rand_weights = np.ones_like(ra_rand, dtype=float)
+                print(f'  Randoms generated uniformly within Gaia mask: {n_randoms:,} points')
+            else:
+                # Fallback: generate uniformly over full sky, then filter
+                ra_rand, dec_rand, r_rand, _ = generate_uniform_randoms(
+                    chi_interp,
+                    n_randoms,
+                    zmin=spec.zmin,
+                    zmax=spec.zmax,
+                    data_z=redshift_source,
+                    seed=seeds['randoms'],
+                )
+                rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
+                rand_weights = np.ones_like(ra_rand, dtype=float)
+        else:
+            # Standard generation for non-Gaia modes
+            ra_rand, dec_rand, r_rand, _ = generate_uniform_randoms(
+                chi_interp,
+                n_randoms,
+                zmin=spec.zmin,
+                zmax=spec.zmax,
+                data_z=redshift_source,
+                seed=seeds['randoms'],
+            )
+            rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
+            rand_weights = np.ones_like(ra_rand, dtype=float)
+        
+        # Apply galactic latitude cut (standard cut, independent of Gaia mask)
+        if spec.gal_lat_cut_deg > 0.0:
+            b_rand = _gal_lat_b(rand_positions[0], rand_positions[1])
+            keep = np.abs(b_rand) >= spec.gal_lat_cut_deg
+            n_before = rand_positions.shape[1]
+            rand_positions = rand_positions[:, keep]
+            rand_weights = rand_weights[keep]
+            print(f'  gal_lat_cut |b|>{spec.gal_lat_cut_deg:.1f}° applied to randoms: '
+                  f'{n_before:,} → {rand_positions.shape[1]:,}')
+        
+        rand_positions, rand_weights = _maybe_apply_sys_to_randoms(
+            spec, catalog, rand_positions, rand_weights
         )
-        rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
-        rand_weights = np.ones_like(ra_rand, dtype=float)
         return rand_positions, rand_weights
 
     rng = np.random.default_rng(seeds['randoms'])
@@ -535,7 +969,111 @@ def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tup
     r_values = np.asarray(r_rand.value if hasattr(r_rand, 'value') else r_rand)
     rand_positions = np.array([ra_rand, dec_rand, r_values], dtype=float)
     rand_weights = np.ones_like(ra_rand, dtype=float)
+    if spec.gal_lat_cut_deg > 0.0:
+        b_rand = _gal_lat_b(rand_positions[0], rand_positions[1])
+        keep = np.abs(b_rand) >= spec.gal_lat_cut_deg
+        n_before = rand_positions.shape[1]
+        rand_positions = rand_positions[:, keep]
+        rand_weights = rand_weights[keep]
+        print(f'  gal_lat_cut |b|>{spec.gal_lat_cut_deg:.1f}° applied to randoms: '
+              f'{n_before:,} → {rand_positions.shape[1]:,}')
+    
+    # Apply Gaia coverage mask to randoms for consistency with masked data
+    if spec.sys_spec_type == 'gaia_stellar':
+        gaia_mask = catalog.metadata.get('gaia_coverage_mask')
+        if gaia_mask is not None:
+            nside = hp.npix2nside(len(gaia_mask))
+            # gaia_mask is True where coverage exists (stellar counts > 0)
+            # We want to keep randoms in these regions
+            theta = np.radians(90.0 - rand_positions[1])
+            phi = np.radians(rand_positions[0])
+            pix = hp.ang2pix(nside, theta, phi, nest=False)
+            keep = gaia_mask[pix]
+            n_before = rand_positions.shape[1]
+            rand_positions = rand_positions[:, keep]
+            rand_weights = rand_weights[keep]
+            n_after = rand_positions.shape[1]
+            print(f'  Gaia coverage mask applied to randoms: {n_before:,} → {n_after:,}')
+    
+    rand_positions, rand_weights = _maybe_apply_sys_to_randoms(
+        spec, catalog, rand_positions, rand_weights
+    )
     return rand_positions, rand_weights
+
+
+def _maybe_apply_sys_to_randoms(
+    spec: ExperimentSpec,
+    catalog: PreparedCatalog,
+    rand_positions: np.ndarray,
+    rand_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Phase C9: optionally apply the multiplicative w_sys to randoms.
+
+    If the all-mu leakage in P(k,mu) is an estimator-level effect (e.g.
+    α-normalization bias), applying the same w_sys to randoms will
+    cancel it and the ratio P_contam/P_clean should equal 1 at all
+    (k, mu). If the leakage persists, it reflects real injected power
+    convolved with the radial-window response of the lightcone.
+    """
+    if not spec.apply_sys_to_randoms:
+        return rand_positions, rand_weights
+    if spec.contamination_mode != 'transverse_multiplicative':
+        return rand_positions, rand_weights
+    sys_map = catalog.metadata.get('transverse_multiplicative_sys_map')
+    if sys_map is None:
+        return rand_positions, rand_weights
+    nside_map = catalog.metadata.get('transverse_multiplicative_nside')
+    if nside_map is None:
+        return rand_positions, rand_weights
+    ra_r = rand_positions[0]
+    dec_r = rand_positions[1]
+    new_weights, _ = modify_fkp_weights(ra_r, dec_r, rand_weights, sys_map, nside=nside_map)
+    return rand_positions, new_weights
+
+
+def _poles_to_wedges(ells, plk_arr: np.ndarray, mu_wedges: np.ndarray) -> np.ndarray:
+    """
+    Convert power spectrum multipoles to μ-wedges analytically.
+
+    P(k, μ₁<μ<μ₂) = Σ_ℓ P_ℓ(k) × W_ℓ(μ₁, μ₂)
+
+    where the bin-averaged Legendre window is:
+      W_0 = 1
+      W_ℓ = [P_{ℓ+1}(μ₂) - P_{ℓ-1}(μ₂) - P_{ℓ+1}(μ₁) + P_{ℓ-1}(μ₁)] / (μ₂ - μ₁)
+            using the recurrence ∫ L_ℓ dμ = [P_{ℓ+1}(μ) - P_{ℓ-1}(μ)] / (2ℓ+1)
+            combined with the (2ℓ+1) prefactor from the multipole expansion.
+
+    Parameters
+    ----------
+    ells : sequence of int, shape (nell,)
+    plk_arr : ndarray, shape (nk, nell)  — multipoles indexed as [k, ell]
+    mu_wedges : ndarray, shape (nmu+1,) — μ bin edges
+
+    Returns
+    -------
+    pkmu : ndarray, shape (nk, nmu)
+    """
+    from scipy.special import legendre as Leg
+
+    nmu = len(mu_wedges) - 1
+    nk = plk_arr.shape[0]
+    pkmu = np.zeros((nk, nmu), dtype=complex)
+
+    for mu_idx in range(nmu):
+        mu1, mu2 = mu_wedges[mu_idx], mu_wedges[mu_idx + 1]
+        dmu = mu2 - mu1
+        for ell_idx, ell in enumerate(ells):
+            if ell == 0:
+                window = 1.0
+            else:
+                # ∫_{μ1}^{μ2} L_ℓ(μ) dμ = [P_{ℓ+1}(μ) - P_{ℓ-1}(μ)]/(2ℓ+1) |_{μ1}^{μ2}
+                Lp = Leg(ell + 1)
+                Lm = Leg(ell - 1)
+                integral = (Lp(mu2) - Lm(mu2) - Lp(mu1) + Lm(mu1)) / (2 * ell + 1)
+                window = (2 * ell + 1) * integral / dmu
+            pkmu[:, mu_idx] += window * plk_arr[:, ell_idx]
+
+    return pkmu
 
 
 def _compute_power_spectra(
@@ -544,27 +1082,96 @@ def _compute_power_spectra(
     rand_positions: np.ndarray,
     rand_weights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute power spectrum P(k, mu) using pypower's CatalogFFTPower.
+    
+    Parameters for CatalogFFTPower:
+    - interlacing=2: FFT interlacing for alias reduction (standard practice)
+    - shotnoise=None: Explicit shot noise handling (auto-estimated if None)
+    - mpiroot=0: MPI compatibility (single-node safe; ignored if not using MPI)
+    
+    For multi-threading: Set OMP_NUM_THREADS environment variable before running.
+    Example: OMP_NUM_THREADS=16 python script.py
+    """
     from pypower import CatalogFFTPower
 
     kedges = build_kedges(spec)
     mu_wedges = build_mu_wedges(spec)
+
+    # Compute wedges and poles simultaneously using los='z' (global plane-parallel),
+    # matching compute_pkmu_mocks exactly. Direct wedge estimation bins the 3D FFT
+    # grid by (|k|, k_z/|k|) and is exact — unlike reconstructing wedges from a
+    # truncated multipole set which loses power in ells beyond the max computed.
+    
+    # For periodic boxes (Quijote), use Cartesian coordinates (xyz) so los='z' refers to the box z-axis.
+    # For lightcones (Halfdome), use spherical coordinates (rdd) for proper angular treatment.
+    position_type = 'xyz' if spec.mock_type == 'quijote' else 'rdd'
+    
     result = CatalogFFTPower(
         data_positions1=catalog.positions_rdd,
         data_weights1=catalog.weights,
         randoms_positions1=rand_positions,
         randoms_weights1=rand_weights,
         nmesh=spec.nmesh,
-        los='z',
-        position_type='rdd',
+        los=spec.los,
+        position_type=position_type,
         resampler='tsc',
         dtype='f8',
         ells=spec.ells,
         edges=(kedges, mu_wedges),
+        interlacing=2,
+        shotnoise=None,
+        mpiroot=0,
     )
     pkmu = result.wedges.get_power()
     plk = result.poles.power
     kcen = result.wedges.k[:, 0]
+
     return kcen, pkmu, plk
+
+
+def _downsample_to_nbar(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+    """
+    Randomly subsample the catalog so its effective comoving number density
+    matches spec.target_nbar [(h/Mpc)^3].
+
+    The comoving volume is computed from the observed radial range of the
+    catalog (after redshift selection) using a full-sky spherical shell:
+        V = (4π/3) * (r_max^3 - r_min^3)
+    which is correct for a full-sky lightcone like Halfdome.
+    If the mock covers a known fraction of the sky it will over-count V and
+    thus under-downsample slightly — but for full-sky mocks this is exact.
+    """
+    n_current = catalog.positions_rdd.shape[1]
+    r = catalog.base_r  # comoving distance in Mpc/h
+
+    r_min = float(r.min())
+    r_max = float(r.max())
+    vol_full_sky = (4.0 * np.pi / 3.0) * (r_max ** 3 - r_min ** 3)  # (Mpc/h)^3
+
+    n_target = int(spec.target_nbar * vol_full_sky)
+    print(
+        f'  nbar downsample: V={vol_full_sky:.3e} (Mpc/h)^3, '
+        f'target N={n_target:,} from nbar={spec.target_nbar:.2e}, '
+        f'current N={n_current:,}'
+    )
+
+    if n_target >= n_current:
+        print(f'  -> target N >= current N, no downsampling applied.')
+        return catalog
+
+    seeds = _stage_seeds(spec, mock_idx)
+    rng = np.random.default_rng(seeds['quijote'])  # reuse a deterministic seed slot
+    keep = rng.choice(n_current, size=n_target, replace=False)
+    keep.sort()
+
+    catalog.positions_rdd = catalog.positions_rdd[:, keep]
+    catalog.weights = catalog.weights[keep]
+    catalog.base_r = catalog.base_r[keep]
+    if catalog.base_redshifts is not None:
+        catalog.base_redshifts = catalog.base_redshifts[keep]
+    catalog.metadata['nbar_downsampled_to'] = n_target
+    return catalog
 
 
 def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | None = None) -> ExperimentResult:
@@ -572,8 +1179,10 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
         dm = desi_mock()
 
     if spec.mock_type == 'quijote':
+        print("Preparing Quijote catalog...")
         catalog = _prepare_quijote_catalog(spec, mock_idx, dm)
     elif spec.mock_type == 'halfdome':
+        print("Preparing Halfdome catalog...")
         catalog = _prepare_halfdome_catalog(spec, mock_idx, dm)
     else:
         raise NotImplementedError(
@@ -581,6 +1190,7 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
         )
 
     if spec.redshift_sel:
+        print("Applying redshift selection...")
         redshift_mask = np.ones_like(catalog.base_redshifts, dtype=bool)
         if spec.zmin is not None:
             redshift_mask &= catalog.base_redshifts > spec.zmin
@@ -597,6 +1207,32 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
                 'Try lowering zmin, enabling replication (replicate=True), or disabling redshift_sel.'
             )
 
+    if spec.target_nbar is not None:
+        print("Applying nbar downsampling...")
+        catalog = _downsample_to_nbar(spec, catalog, mock_idx)
+
+    if spec.gal_lat_cut_deg > 0.0:
+        print("Applying galactic latitude cut...")
+        catalog = _apply_gal_lat_cut(catalog, spec.gal_lat_cut_deg)
+
+    # For Gaia stellar systematics, apply the extragalactic coverage mask EARLY.
+    # This ensures all three contamination modes (none, additive, multiplicative) use
+    # the same masked data for fair comparison. The mask is applied before contamination
+    # to avoid dimensional mismatches.
+    if spec.sys_spec_type == 'gaia_stellar':
+        print("Applying Gaia stellar systematics mask...")
+        gaia_mask = _load_or_compute_gaia_healpix_mask(mock_idx)
+        nside = hp.npix2nside(len(gaia_mask))
+        catalog = _apply_healpix_mask_to_catalog(catalog, gaia_mask, nside=nside)
+        # Store the mask in metadata so randoms generation can apply it too
+        catalog.metadata['gaia_coverage_mask'] = gaia_mask
+
+    # Cache the original (pre-mask) redshift distribution so randoms maintain
+    # constant comoving density regardless of which angular regions are masked.
+    if catalog.base_redshifts is not None:
+        catalog.metadata['original_base_redshifts'] = catalog.base_redshifts.copy()
+
+    print('Applying contamination...')
     catalog = _apply_contamination(spec, catalog, mock_idx)
     rand_positions, rand_weights = _build_random_catalog(spec, catalog)
     kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
@@ -630,6 +1266,7 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
     run_records: list[dict[str, Any]] = []
 
     for mock_idx in range(nmock):
+        print(f'  [{mock_idx + 1}/{nmock}] Computing...')
         result = run_single_experiment(spec, mock_idx=mock_idx, dm=dm)
         all_pkmu[mock_idx] = result.all_pkmu[0]
         all_plk[mock_idx] = result.all_plk[0]
