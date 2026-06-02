@@ -1091,19 +1091,6 @@ def plot_angular_power_spectrum_periodic(fig_dir: str) -> None:
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.loglog(k_centers, pk_norm, 'o-', linewidth=1.5, markersize=5, label='Measured $P(k)$', color='C0')
     
-    # Expected power law overlay
-    # if SYS_SPEC_TYPE == 'power_law' and len(k_centers) > 1:
-    #     k_min_pl = k_centers[0]
-    #     k_max_pl = k_centers[-1]
-    #     k_theory = np.geomspace(k_min_pl, k_max_pl, 200)
-    #     pk_theory = 1.0 / (k_theory ** 2)
-        # Normalize theory to match measured at ell_min
-        # k_ref = max(k_min_pl, SYS_ELL_MIN * boxsize / (2 * np.pi * ngrid))
-        # pk_theory_at_ref = 1.0 / k_ref ** 2
-        # pk_measured_at_ref = np.interp(k_ref, k_centers, pk_norm)
-        # pk_theory *= pk_measured_at_ref / pk_theory_at_ref
-        # ax.loglog(k_theory, pk_theory, '--', linewidth=2, label=r'$P(k) \propto 1/k^2$', color='C1')
-    
     # ylim: show down to 1e-4 of peak
     significant = pk_norm > 1e-4
     if significant.any():
@@ -1374,6 +1361,179 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     print(f'Saved: {fpath}')
 
 
+def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
+    """
+    Compute and plot the P(k,μ) power spectrum of the pure contamination field
+    for halfdome lightcones.
+    
+    This shows the intrinsic power spectrum structure of the contaminant field
+    in the lightcone geometry with realistic N(z) from halfdome.
+    
+    Method:
+    1. Generate the contamination field sys_map (HEALPix full-sky map)
+    2. Load halfdome mock to extract empirical N(z)
+    3. Sample RA/Dec positions according to contamination field distribution
+    4. All galaxy weights = 1 (contamination is in the positions, not weights)
+    5. Sample redshifts from halfdome N(z) to get comoving distances
+    6. Compute P(k,μ) using CatalogFFTPower with same config as data
+    """
+    from pypower import CatalogFFTPower
+    from nonunif_binning import compute_null_bins
+    from astropy.cosmology import Planck18 as cosmo
+    import healpy as hp
+    
+    os.makedirs(fig_dir, exist_ok=True)
+    mock_idx = 0
+    nside_sys = 256  # HEALPix resolution for contamination field
+    
+    print('Loading halfdome mock to extract N(z)...')
+    dm = desi_mock()
+    dm.halfdome_mock_basedir = DEFAULT_HALFDOME_BASEDIR
+    galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=1_000_000)
+
+    redshift_sel = (redshift > 0.4) & (redshift < 1.0)
+    galpos = galpos[redshift_sel]
+    redshift = redshift[redshift_sel]
+    
+    # Generate the contamination field (HEALPix full-sky map)
+    seed_dust = 42 + mock_idx * 10_000 + 2
+    sys_map = gen_controlled_transverse_map(
+        amp=SYS_AMP,
+        seed=seed_dust,
+        spec_type=SYS_SPEC_TYPE,
+        ell_max=SYS_ELL_MAX,
+        ell_min=SYS_ELL_MIN,
+        ell_delta=SYS_ELL_DELTA,
+        periodic=False,
+        nside=nside_sys,
+    )
+    
+    # Sample RA/Dec positions according to contamination field distribution
+    # Use the field values (normalized) as pixel weights, then sample RA/Dec from those pixels
+    rng = np.random.default_rng(seed=42)
+    n_gal = int(0.1 * NMESH ** 3)  # ~10% of mesh volume, ~1.3M for NMESH=512
+    
+    # Normalize contamination map to use as sampling probabilities
+    # Use absolute value to handle both positive and negative deviations
+    prob_map = np.abs(sys_map)
+    prob_map = prob_map / np.sum(prob_map)  # Normalize to sum to 1
+    
+    # Sample pixel indices according to probability distribution
+    npix = len(sys_map)
+    pixel_indices = rng.choice(npix, size=n_gal, replace=True, p=prob_map)
+    
+    # Convert pixel indices to RA/Dec
+    # Get pixel centers
+    theta_pix, phi_pix = hp.pix2ang(nside_sys, pixel_indices, nest=False)
+    ra_gal = np.degrees(phi_pix)
+    dec_gal = 90.0 - np.degrees(theta_pix)
+    
+    # Add small random offsets within pixels for smoother distribution
+    pixel_size_deg = np.degrees(hp.nside2resol(nside_sys))
+    ra_gal += rng.uniform(-pixel_size_deg/2, pixel_size_deg/2, size=n_gal)
+    dec_gal += rng.uniform(-pixel_size_deg/2, pixel_size_deg/2, size=n_gal)
+    
+    # Wrap RA to [0, 360) and clip Dec to [-90, 90]
+    ra_gal = ra_gal % 360.0
+    dec_gal = np.clip(dec_gal, -90.0, 90.0)
+    
+    # Sample redshifts from halfdome N(z) distribution
+    # Use empirical CDF from loaded redshifts
+    z_sorted = np.sort(redshift)
+    z_min, z_max = z_sorted[0], z_sorted[-1]
+    
+    # Draw uniform samples and interpolate into sorted z array
+    uniform_samples = rng.uniform(0, len(redshift) - 1, size=n_gal)
+    z_sampled = np.interp(uniform_samples, np.arange(len(redshift)), z_sorted)
+    
+    # Convert redshifts to comoving distances
+    r_sampled_mpc = cosmo.comoving_distance(z_sampled).value  # Mpc (physical)
+    r_sampled = r_sampled_mpc * cosmo.h  # Convert to Mpc/h
+    
+    # Arrange as (3, N) for CatalogFFTPower with position_type='rdd'
+    pos_array = np.vstack([ra_gal, dec_gal, r_sampled])
+    
+    # All data weights are 1 (contamination is in spatial distribution only)
+    weights = np.ones(n_gal)
+    
+    print(f'Contamination field catalog: {n_gal:,} galaxies (sampled from field)')
+    print(f'  RA range: [{ra_gal.min():.2f}, {ra_gal.max():.2f}]°')
+    print(f'  Dec range: [{dec_gal.min():.2f}, {dec_gal.max():.2f}]°')
+    print(f'  z range: [{z_sampled.min():.4f}, {z_sampled.max():.4f}]')
+    print(f'  r range: [{r_sampled.min():.2f}, {r_sampled.max():.2f}] Mpc/h')
+    
+    # Generate random catalog (uniform RA/Dec, unit weights)
+    n_randoms = int(10 * n_gal)
+    ra_rand = rng.uniform(0.0, 360.0, size=n_randoms)
+    dec_rand = np.degrees(np.arcsin(rng.uniform(-1.0, 1.0, size=n_randoms)))
+    
+    # Sample redshifts from same distribution
+    uniform_samples_rand = rng.uniform(0, len(redshift) - 1, size=n_randoms)
+    z_rand = np.interp(uniform_samples_rand, np.arange(len(redshift)), z_sorted)
+    r_rand_mpc = cosmo.comoving_distance(z_rand).value
+    r_rand = r_rand_mpc * cosmo.h
+    
+    rand_array = np.vstack([ra_rand, dec_rand, r_rand])
+    rand_weights = np.ones(n_randoms)
+    
+    # Build k and mu bins using same config as data
+    mu_wedges = compute_null_bins(np.max(ELLS), N_CLEAN_BINS)
+    kedges = np.arange(K_MIN, K_MAX + DELTA_K, DELTA_K)
+    edges = (kedges, mu_wedges)
+    
+    print(f'Mu wedges: {mu_wedges}')
+    print(f'K edges: {kedges[:5]}...{kedges[-5:]}')
+    
+    # Compute power spectrum using spherical (rdd) coordinates for lightcone
+    result = CatalogFFTPower(
+        data_positions1=pos_array,
+        data_weights1=weights,
+        randoms_positions1=rand_array,
+        randoms_weights1=rand_weights,
+        nmesh=NMESH,
+        los='z',
+        position_type='rdd',
+        resampler='tsc',
+        dtype='f8',
+        ells=ELLS,
+        edges=edges,
+        interlacing=2,
+        shotnoise=None,
+        mpiroot=0,
+    )
+    
+    pkmu = result.wedges.get_power().real
+    kcen = result.wedges.k[:, 0].real
+    nmu = len(mu_wedges) - 1
+    
+    # Plot k*P(k,μ) for each mu wedge
+    fig = plt.figure(figsize=(6, 5))
+    cmap = plt.get_cmap('jet')
+    
+    for mu_idx in range(nmu):
+        kp = kcen * pkmu[:, mu_idx]
+        plt.plot(kcen, kp, 'o-', linewidth=2, markersize=4, color=cmap(mu_idx / nmu),
+                label=f'μ ∈ [{mu_wedges[mu_idx]:.2f}, {mu_wedges[mu_idx+1]:.2f}]')
+    
+    plt.ylabel(r'$k P(k,\mu)$ [$({\rm Mpc}/h)^2$]', fontsize=11)
+    plt.yscale('log')
+    plt.xscale('log')
+    plt.legend(fontsize=10, loc=3, ncol=2, facecolor='white', edgecolor='gray')
+    plt.grid(alpha=0.3, which='both')
+    
+    plt.xlabel('k [h/Mpc]', fontsize=11)
+    plt.title(
+        f'Contamination field P(k,μ) (halfdome lightcone)\n'
+        f'spec_type={SYS_SPEC_TYPE}, sys_amp={SYS_AMP}',
+        fontsize=12
+    )
+    plt.tight_layout()
+    fpath = os.path.join(fig_dir, 'contaminant_pkmu_halfdome.png')
+    fig.savefig(fpath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {fpath}')
+
+
 def parse_args():
     """Parse CLI arguments and update module globals."""
     global RUN_NAME, NMOCK, SAVE_DIR, FIG_DIR, SYS_AMP, SYS_SPEC_TYPE, SYS_AMP_MODE
@@ -1547,6 +1707,8 @@ def main():
     print('Generating contamination field P(k,μ) power spectrum...')
     if MOCK_TYPE == 'quijote':
         plot_contaminant_pkmu(FIG_DIR)
+    elif MOCK_TYPE == 'halfdome':
+        plot_contaminant_pkmu_halfdome(FIG_DIR)
 
     print('Generating galaxy density visualization...')
     if MOCK_TYPE == 'quijote':

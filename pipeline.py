@@ -465,6 +465,8 @@ def _prepare_halfdome_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock
     positions_rdd = np.vstack([ra, dec, r_values])
     weights = np.ones_like(ra, dtype=float)
 
+    print('halfdome catalog has shape', positions_rdd.shape)
+
     return PreparedCatalog(
         positions_rdd=positions_rdd,
         weights=weights,
@@ -644,6 +646,19 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
             )
         else:
             ra_inject, dec_inject = np.array([]), np.array([])
+
+        n_inject = len(ra_inject)
+        rand_indices = rng.choice(len(catalog.base_r), size=n_inject, replace=True)
+        r_star = catalog.base_r[rand_indices]
+        galpos_inj = np.vstack([ra_inject, dec_inject, r_star])
+
+        print('gal pos inject from healpix map has shape', galpos_inj.shape)
+
+        print('catalog rmin/rmax:', catalog.base_r.min(), catalog.base_r.max())
+        print('injected rmin/rmax:', galpos_inj[2].min(), galpos_inj[2].max())
+        print('catalog ra/dec min/max:', catalog.positions_rdd[0].min(), catalog.positions_rdd[0].max(), catalog.positions_rdd[1].min(), catalog.positions_rdd[1].max())
+        print('injected ra/dec min/max:', galpos_inj[0].min(), galpos_inj[0].max(), galpos_inj[1].min(), galpos_inj[1].max())
+
     else:
         # Periodic 2D FFT path: sample positions uniformly in transverse plane,
         # then accept/reject with probability proportional to positive part of map.
@@ -671,7 +686,7 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
             xs_inj = np.array([p[0] for p in accepted_xy])
             ys_inj = np.array([p[1] for p in accepted_xy])
             zs_inj = np.random.uniform(0.0, boxsize_use, size=n_inject)  # Randomize z to avoid artificial clustering in the middle plane
-            galpos_inj = np.stack([xs_inj, ys_inj, zs_inj], axis=1)
+            galpos_inj = np.stack([xs_inj, ys_inj, zs_inj], axis=1).T
 
 
     inject_weights = np.ones(n_inject, dtype=float)
@@ -679,12 +694,13 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     print('positions rdd has shape', catalog.positions_rdd.shape)
     print('inject positions has shape', galpos_inj.shape)
 
-    catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj.T], axis=1)
+    catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj], axis=1)
 
     print("catalog.positions_rdd now has shape ", catalog.positions_rdd.shape)
     print('catalog.weights has shape', catalog.weights.shape)
 
     catalog.weights = np.concatenate([catalog.weights, inject_weights])
+    print('catalog.weights after injection has shape', catalog.weights.shape)
 
     return catalog
 
@@ -719,51 +735,6 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
     catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
     return catalog
-
-# def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
-#     seeds = _stage_seeds(spec, mock_idx)
-#     periodic = (spec.mock_type == 'quijote')
-#     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
-    
-#     # Use cached contamination map (computed once per mock_idx, reused across modes)
-#     sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
-
-#     ra = catalog.positions_rdd[0]
-#     dec = catalog.positions_rdd[1]
-
-#     if not periodic:
-#         # HEALPix map: use existing modify_fkp_weights (samples by RA/Dec)
-#         nside_map = hp.npix2nside(len(sys_map))
-#         weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
-#     else:
-#         # Recover Cartesian (x, y) from (RA, Dec, r) by inverting
-#         # convert_to_ra_dec_distance:
-#         #   ra  = atan2(y - L/2, x - L/2)  →  x = r_perp*cos(ra) + L/2
-#         #   dec = asin((z - L/2) / r)       →  y = r_perp*sin(ra) + L/2
-#         # where r_perp = r * cos(dec) is the transverse distance.
-#         r_vals = catalog.positions_rdd[2]
-#         ra_rad  = np.radians(ra)
-#         dec_rad = np.radians(dec)
-#         r_perp  = r_vals * np.cos(dec_rad)
-#         x_box   = r_perp * np.cos(ra_rad) + boxsize_use / 2.0
-#         y_box   = r_perp * np.sin(ra_rad) + boxsize_use / 2.0
-#         ngrid   = sys_map.shape[0]
-#         ix = np.floor(x_box / boxsize_use * ngrid).astype(int) % ngrid
-#         iy = np.floor(y_box / boxsize_use * ngrid).astype(int) % ngrid
-#         dn_over_n = sys_map[ix, iy]
-#         w_sys = np.clip(1.0 + dn_over_n, 0.01, 10.0)
-#         weights = catalog.weights * w_sys
-#         sys_weights = w_sys
-
-#     catalog.weights = weights
-#     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
-#     # Stash the input map + nside so _build_random_catalog can apply the
-#     # same w_sys to randoms when spec.apply_sys_to_randoms is set.
-#     catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
-#     if not periodic:
-#         catalog.metadata['transverse_multiplicative_nside'] = hp.npix2nside(len(sys_map))
-#     return catalog
-
 
 def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
     valid_modes = {'none', 'stellar', 'dust', 'both', 'transverse_additive', 'transverse_multiplicative'}
@@ -1234,9 +1205,6 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
         print('rand weights are all ones:', np.all(rand_weights == 1.0))
     else:
         rand_positions, rand_weights = _build_random_catalog(spec, catalog)
-
-    # rand_positions = np.random.uniform(0, boxsize_use, size=(3, 1000))  # Placeholder randoms for testing
-# 
 
     if spec.mock_type=='quijote':
         print('Catalog positions (x,y,z) range after contamination:')
