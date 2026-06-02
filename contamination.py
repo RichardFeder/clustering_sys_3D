@@ -146,13 +146,42 @@ def redshift_err(sig_level):
 
 
 def load_gaia_stellar_density(fpath=None, plot=True, vmax=500):
-
-    if fpath is None:
-        fpath = 'stars/stellar_density_map_12_lt_g_lt_17.npy'
+    """
+    Load Gaia stellar density map as a HEALPix map (nside=128).
     
-    stellar_map = np.load(fpath)
+    First tries the SPHEREx-masked FITS version (nside=128, G=19-20 mag band).
+    Falls back to legacy .npy file if FITS not found.
+    
+    Parameters
+    ----------
+    fpath : str, optional
+        Path to map file (.fits or .npy). Default tries masked FITS first.
+    plot : bool, optional
+        Whether to display mollview projection. Default True.
+    vmax : float, optional
+        Maximum value for mollview colorbar. Default 500.
+    
+    Returns
+    -------
+    stellar_map : ndarray
+        HEALPix map with 196608 pixels (nside=128).
+    """
+    import os
+    
+    if fpath is None:
+        # Try new SPHEREx-masked FITS version first (has SPHEREx masks applied)
+        fits_default = 'data/gaia_star_G_19_20.fits'
+        npy_default = 'stars/stellar_density_map_12_lt_g_lt_17.npy'
+        fpath = fits_default if os.path.exists(fits_default) else npy_default
+    
+    # Load based on file extension
+    if fpath.endswith('.fits'):
+        stellar_map = hp.read_map(fpath)
+    else:
+        stellar_map = np.load(fpath)
+    
     if plot:
-        hp.mollview(stellar_map, title='Gaia stellar density, $12 < G < 17$', max=vmax)
+        hp.mollview(stellar_map, title='Gaia stellar density (SPHEREx-masked)', max=vmax)
         plt.show()
 
     return stellar_map
@@ -266,7 +295,7 @@ def gen_dn_n_map(cl_sfd=None, grf_map=None, alpha=-10, std=0.01, seed=None):
 
 
 def gen_controlled_transverse_map(amp, nside=256, seed=None, spec_type='power_law',
-                                   ell_max=64, ell_min=6, ell_delta=None,
+                                   ell_max=64, ell_min=2, ell_delta=None,
                                    periodic=False, boxsize=1000.0, ngrid=256):
     """
     Generate a controlled transverse-only systematic map as a Gaussian Random Field.
@@ -327,7 +356,9 @@ def gen_controlled_transverse_map(amp, nside=256, seed=None, spec_type='power_la
             mask = (ells >= ell_min) & (ells <= ell_max)
             cl[mask] = 1.0
         elif spec_type == 'power_law':
-            mask = (ells >= max(ell_min, 1)) & (ells <= ell_max)
+            # No hard upper cutoff — power law extends smoothly to lmax.
+            # ell_min sets the large-scale floor; ell_max is ignored for this spec_type.
+            mask = ells >= max(ell_min, 1)
             cl[mask] = 1.0 / ells[mask] ** 2
         elif spec_type == 'delta':
             if ell_min <= ell_delta <= min(ell_max, lmax):
@@ -343,43 +374,36 @@ def gen_controlled_transverse_map(amp, nside=256, seed=None, spec_type='power_la
 
     else:
         # --- 2D FFT synthesis for periodic boxes ---
-        # Build 2D k-grid (units: 2pi/boxsize * integer)
-        k_fund = 2.0 * np.pi / boxsize
-        kfreqs = np.fft.fftfreq(ngrid, d=1.0 / ngrid)  # integer mode numbers
-        kx, ky = np.meshgrid(kfreqs, kfreqs, indexing='ij')
-        k_mag = np.sqrt(kx ** 2 + ky ** 2)  # in units of fundamental mode number
+        # Use rfft2/irfft2 (half-space) so the output is automatically real with no
+        # manual Hermitian symmetrization — that approach introduced correlated
+        # conjugate pairs that appeared as diagonal bands in the map.
+        nr = ngrid // 2 + 1
+        kx_r = np.fft.fftfreq(ngrid, d=1.0 / ngrid)   # full range, axis 0
+        ky_r = np.fft.rfftfreq(ngrid, d=1.0 / ngrid)  # non-negative only, axis 1
+        KX, KY = np.meshgrid(kx_r, ky_r, indexing='ij')
+        k_mag = np.sqrt(KX ** 2 + KY ** 2)  # in units of fundamental mode number
 
-        # Build 2D power spectrum using mode numbers (analogous to ell)
-        pk2d = np.zeros((ngrid, ngrid))
+        # Build 2D power spectrum on the rfft2 half-space
+        pk2d = np.zeros((ngrid, nr))
         with np.errstate(divide='ignore', invalid='ignore'):
             if spec_type == 'flat':
                 pk2d = np.where((k_mag >= ell_min) & (k_mag <= ell_max), 1.0, 0.0)
             elif spec_type == 'power_law':
-                pk2d = np.where(
-                    (k_mag >= max(ell_min, 1)) & (k_mag <= ell_max),
-                    1.0 / k_mag ** 2,
-                    0.0,
-                )
-                pk2d[0, 0] = 0.0  # zero DC mode
+                # Continuous 1/k^2 from ell_min to Nyquist — no hard upper cutoff.
+                pk2d = np.where(k_mag >= max(ell_min, 1), 1.0 / k_mag ** 2, 0.0)
             elif spec_type == 'delta':
                 # Annular shell: modes within 0.5 of ell_delta
                 pk2d = np.where(np.abs(k_mag - ell_delta) < 0.5, 1.0, 0.0)
             else:
                 raise ValueError(f"Unknown spec_type='{spec_type}'. Use 'flat', 'power_law', or 'delta'.")
+        pk2d[0, 0] = 0.0  # zero DC / mean
 
-        # Sample complex Gaussian amplitudes with variance proportional to pk2d
-        # Use proper Hermitian symmetry so IFFT produces a real field
-        noise_re = rng.standard_normal((ngrid, ngrid))
-        noise_im = rng.standard_normal((ngrid, ngrid))
-        amp_grid = np.sqrt(pk2d) * (noise_re + 1j * noise_im)
-
-        # Enforce Hermitian symmetry: field_k[-kx,-ky] = conj(field_k[kx,ky])
-        amp_grid = np.fft.ifftshift(
-            0.5 * (np.fft.ifftshift(amp_grid) + np.conj(np.fft.ifftshift(amp_grid)[::-1, ::-1]))
-        )
-        amp_grid[0, 0] = 0.0  # zero mean
-
-        map_out = np.fft.ifft2(amp_grid).real
+        # Draw independent complex Gaussian amplitudes; divide by sqrt(2) so each
+        # real DOF has unit variance after irfft2.
+        noise = (rng.standard_normal((ngrid, nr)) +
+                 1j * rng.standard_normal((ngrid, nr))) / np.sqrt(2)
+        amp_grid = np.sqrt(pk2d) * noise
+        map_out = np.fft.irfft2(amp_grid, s=(ngrid, ngrid))
 
     # Normalize to requested rms amplitude
     map_out -= np.mean(map_out)

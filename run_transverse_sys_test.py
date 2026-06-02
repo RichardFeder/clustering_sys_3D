@@ -59,7 +59,7 @@ SYS_ELL_MAX   = 16
 SYS_ELL_DELTA = None
 DS_FAC        = 20
 NMESH         = 512
-K_MIN         = 0.002
+K_MIN         = 0.006
 K_MAX         = 0.2
 DELTA_K       = 0.01
 ELLS          = (0, 2, 4, 6, 8, 10, 12, 14, 16)
@@ -294,7 +294,7 @@ def plot_pkmu_comparison(results: dict[str, dict], fig_dir: str) -> None:
         pkmu_sys = res['all_pkmu'].real
         ax.set_title(f'{MODE_LABELS[mode]}\nvs. clean', fontsize=12)
         ax.axhline(1.0, color='grey', lw=1.5, ls='-', zorder=0)
-        ax.axhline((1.0 / (1.0 + effective_sys_amp)) ** 2, color='k', lw=1.2, ls='--', zorder=0)
+        ax.axhline((1.0 / (1.0 + effective_sys_amp)) ** 2, color='k', lw=1.2, ls='--', zorder=0, label='$(1+f_{*})^{-2}$ dilution')
         for mu_idx in range(nmu):
             mu_lab = (f'{mu_wedges[mu_idx]:.2f}' + r'$<\mu<$' +
                       f'{mu_wedges[mu_idx+1]:.2f}')
@@ -1282,7 +1282,7 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
         seed=seed_dust,
         spec_type=SYS_SPEC_TYPE,
         ell_max=SYS_ELL_MAX,
-        ell_min=2,
+        ell_min=SYS_ELL_MIN,
         ell_delta=SYS_ELL_DELTA,
         periodic=True,
         boxsize=boxsize,
@@ -1321,6 +1321,8 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     mu_wedges = compute_null_bins(np.max(ELLS), N_CLEAN_BINS)
     print('Mu wedges:', mu_wedges)
     kedges = np.arange(K_MIN, K_MAX + DELTA_K, DELTA_K)
+    print('k edges in plot contaminant Pkmu:', kedges)
+
     edges = (kedges, mu_wedges)
     
     result = CatalogFFTPower(
@@ -1341,10 +1343,7 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     kcen = result.wedges.k[:, 0].real
     nmu = len(mu_wedges) - 1
     
-    # Plot: k*P(k,μ) for each μ bin
-    # fig, axes = plt.subplots(nmu//2, 2, figsize=(5, nmu), sharex=True)
-
-    fig = plt.figure(figsize=(7, 6))
+    fig = plt.figure(figsize=(6, 5))
     if nmu == 1:
         axes = [axes]
 
@@ -1358,6 +1357,7 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
 
     plt.ylabel(r'$k P(k,\mu)$ [$({\rm Mpc}/h)^2$]', fontsize=11)
     plt.yscale('log')
+    plt.xscale('log')
     plt.legend(fontsize=10, loc=3, ncol=2, facecolor='white', edgecolor='gray')
     plt.grid(alpha=0.3, which='both')
     
@@ -1404,7 +1404,7 @@ def parse_args():
                    help='Downsampling factor (larger = faster, fewer galaxies).')
     p.add_argument('--nmesh',     type=int,   default=128,
                    help='FFT mesh size for power-spectrum estimation.')
-    p.add_argument('--k-min',     type=float, default=0.002,
+    p.add_argument('--k-min',     type=float, default=0.006,
                    help='Minimum k for power spectrum binning [h/Mpc].')
     p.add_argument('--k-max',     type=float, default=0.2,
                    help='Maximum k for power spectrum binning [h/Mpc].')
@@ -1544,9 +1544,9 @@ def main():
     elif MOCK_TYPE == 'halfdome':
         plot_angular_power_spectrum_healpix(FIG_DIR)
 
-    # print('Generating contamination field P(k,μ) power spectrum...')
-    # if MOCK_TYPE == 'quijote':
-    #     plot_contaminant_pkmu(FIG_DIR)
+    print('Generating contamination field P(k,μ) power spectrum...')
+    if MOCK_TYPE == 'quijote':
+        plot_contaminant_pkmu(FIG_DIR)
 
     print('Generating galaxy density visualization...')
     if MOCK_TYPE == 'quijote':

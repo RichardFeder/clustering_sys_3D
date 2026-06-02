@@ -66,7 +66,7 @@ class ExperimentSpec:
     ds_fac: int = 5
     randomize: bool = False
     n_sample: int = 20_000_000
-    k_min: float = 0.002
+    k_min: float = 0.006
     k_max: float = 0.2
     delta_k: float = 0.01
     mu_min: float = 0.0
@@ -360,7 +360,8 @@ def _prepare_quijote_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock)
     # For periodic box, keep positions in Cartesian coordinates (x, y, z)
     # This ensures los='z' in CatalogFFTPower correctly refers to the box z-axis
     positions_rdd = galpos.T
-    weights = np.ones_like(positions_rdd, dtype=float)
+    weights = np.ones(positions_rdd.shape[1], dtype=float)
+    # weights = np.ones_like(positions_rdd, dtype=float)
     base_r = galpos[2]  # z-coordinate as the radial/depth coordinate
 
     # For periodic box, no redshift_sel is applied (the z-coordinate IS the radial coordinate)
@@ -633,51 +634,6 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     rng = np.random.default_rng(seeds['stellar_map'])
 
     if not periodic:
-        # HEALPix path
-        # nside_map = hp.npix2nside(len(sys_map))
-        # npix = len(sys_map)
-
-        # if spec.mean_conserving_additive:
-        #     # ─── Mean-conserving injection ──────────────────────────────
-        #     # Realize δn(p) = n_per_pix × sys_map(p) as a Poisson process:
-        #     #   * In positive-lobe pixels: ADD sources with rate
-        #     #         λ_add(p) = n_per_pix × sys_map(p)
-        #     #   * In negative-lobe pixels: REMOVE existing galaxies with
-        #     #         p_rem(p) = |sys_map(p)|  (≤ 1 for sys_amp ≪ 1)
-        #     # Net <ΔN> = 0; angular density modulation = sys_map; no
-        #     # clipped-Gaussian distortion of the input angular spectrum.
-        #     n_per_pix = n_gal / npix
-        #     positive_part = np.clip(sys_map, 0.0, None)
-        #     negative_part = np.clip(-sys_map, 0.0, None)
-
-        #     # ADD step
-        #     expected_counts_add = n_per_pix * positive_part
-        #     if expected_counts_add.sum() > 0:
-        #         ra_inject, dec_inject = generate_poisson_radec_from_map(
-        #             expected_counts_add, seed=seeds['stellar_radec']
-        #         )
-        #     else:
-        #         ra_inject, dec_inject = np.array([]), np.array([])
-
-        #     # REMOVE step (operates on the existing catalog FIRST so that
-        #     # any base_r resampling below draws from the surviving sources).
-        #     theta_gal = np.radians(90.0 - catalog.positions_rdd[1])
-        #     phi_gal = np.radians(catalog.positions_rdd[0])
-        #     pix_gal = hp.ang2pix(nside_map, theta_gal, phi_gal)
-        #     p_remove = np.clip(negative_part[pix_gal], 0.0, 1.0)
-        #     rng_rem = np.random.default_rng(int(seeds['stellar_radec']) + 1)
-        #     keep_mask = rng_rem.uniform(0.0, 1.0, size=p_remove.shape) >= p_remove
-        #     n_removed = int((~keep_mask).sum())
-        #     if n_removed > 0:
-        #         catalog.positions_rdd = catalog.positions_rdd[:, keep_mask]
-        #         catalog.weights = catalog.weights[keep_mask]
-        #         if catalog.base_redshifts is not None:
-        #             catalog.base_redshifts = catalog.base_redshifts[keep_mask]
-        #         if catalog.base_r is not None:
-        #             catalog.base_r = catalog.base_r[keep_mask]
-        #     catalog.metadata['transverse_additive_removed'] = n_removed
-        # else:
-        # Legacy one-sided positive-lobe injection (biases n_gal upward)
         positive_map = np.clip(sys_map, 0.0, None)
         total_weight = positive_map.sum()
         if total_weight > 0:
@@ -714,24 +670,11 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
             accepted_xy = accepted_xy[:n_inject]
             xs_inj = np.array([p[0] for p in accepted_xy])
             ys_inj = np.array([p[1] for p in accepted_xy])
-            # Convert transverse (x,y) to RA/Dec only; use a dummy z for the
-            # coordinate conversion (r will be resampled from catalog.base_r below).
-            zs_dummy = np.full(n_inject, boxsize_use / 2.0)
-            galpos_inj = np.stack([xs_inj, ys_inj, zs_dummy], axis=1)
-            # ra_inject, dec_inject, _ = convert_to_ra_dec_distance(galpos_inj, boxsize_use)
+            zs_inj = np.random.uniform(0.0, boxsize_use, size=n_inject)  # Randomize z to avoid artificial clustering in the middle plane
+            galpos_inj = np.stack([xs_inj, ys_inj, zs_inj], axis=1)
 
-    # if len(ra_inject) == 0:
-    #     catalog.metadata['transverse_additive_injected'] = 0
-    #     return catalog
 
-    # Draw radial distances from the (already redshift-selected) catalog so
-    # injected sources occupy the same radial shell as the true galaxies.
-    # rng2 = np.random.default_rng(seeds['stellar_redshift'])
-    # rand_idx = rng2.choice(len(catalog.base_r), size=len(ra_inject), replace=True)
-    # r_inject = catalog.base_r[rand_idx]
-
-    # inject_positions = np.vstack([ra_inject, dec_inject, r_inject])
-    inject_weights = np.ones_like(galpos_inj, dtype=float)
+    inject_weights = np.ones(n_inject, dtype=float)
 
     print('positions rdd has shape', catalog.positions_rdd.shape)
     print('inject positions has shape', galpos_inj.shape)
@@ -739,11 +682,10 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj.T], axis=1)
 
     print("catalog.positions_rdd now has shape ", catalog.positions_rdd.shape)
+    print('catalog.weights has shape', catalog.weights.shape)
 
-    print('catalog.weights has shpae', catalog.weights.shape)
+    catalog.weights = np.concatenate([catalog.weights, inject_weights])
 
-    catalog.weights = np.concatenate([catalog.weights, inject_weights.T], axis=1)
-    # catalog.metadata['transverse_additive_injected'] = len(xs_inj)
     return catalog
 
 
@@ -751,30 +693,21 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
     seeds = _stage_seeds(spec, mock_idx)
     periodic = (spec.mock_type == 'quijote')
     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
-    
-    # Use cached contamination map (computed once per mock_idx, reused across modes)
+
     sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
 
-    ra = catalog.positions_rdd[0]
-    dec = catalog.positions_rdd[1]
-
     if not periodic:
-        # HEALPix map: use existing modify_fkp_weights (samples by RA/Dec)
+        ra = catalog.positions_rdd[0]
+        dec = catalog.positions_rdd[1]
         nside_map = hp.npix2nside(len(sys_map))
         weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
+        catalog.metadata['transverse_multiplicative_nside'] = nside_map
     else:
-        # Recover Cartesian (x, y) from (RA, Dec, r) by inverting
-        # convert_to_ra_dec_distance:
-        #   ra  = atan2(y - L/2, x - L/2)  →  x = r_perp*cos(ra) + L/2
-        #   dec = asin((z - L/2) / r)       →  y = r_perp*sin(ra) + L/2
-        # where r_perp = r * cos(dec) is the transverse distance.
-        r_vals = catalog.positions_rdd[2]
-        ra_rad  = np.radians(ra)
-        dec_rad = np.radians(dec)
-        r_perp  = r_vals * np.cos(dec_rad)
-        x_box   = r_perp * np.cos(ra_rad) + boxsize_use / 2.0
-        y_box   = r_perp * np.sin(ra_rad) + boxsize_use / 2.0
-        ngrid   = sys_map.shape[0]
+        # positions_rdd stores raw Cartesian (x, y, z) for periodic boxes —
+        # no RA/Dec inversion needed
+        x_box = catalog.positions_rdd[0]
+        y_box = catalog.positions_rdd[1]
+        ngrid = sys_map.shape[0]
         ix = np.floor(x_box / boxsize_use * ngrid).astype(int) % ngrid
         iy = np.floor(y_box / boxsize_use * ngrid).astype(int) % ngrid
         dn_over_n = sys_map[ix, iy]
@@ -784,12 +717,52 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
 
     catalog.weights = weights
     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
-    # Stash the input map + nside so _build_random_catalog can apply the
-    # same w_sys to randoms when spec.apply_sys_to_randoms is set.
     catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
-    if not periodic:
-        catalog.metadata['transverse_multiplicative_nside'] = hp.npix2nside(len(sys_map))
     return catalog
+
+# def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
+#     seeds = _stage_seeds(spec, mock_idx)
+#     periodic = (spec.mock_type == 'quijote')
+#     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
+    
+#     # Use cached contamination map (computed once per mock_idx, reused across modes)
+#     sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
+
+#     ra = catalog.positions_rdd[0]
+#     dec = catalog.positions_rdd[1]
+
+#     if not periodic:
+#         # HEALPix map: use existing modify_fkp_weights (samples by RA/Dec)
+#         nside_map = hp.npix2nside(len(sys_map))
+#         weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
+#     else:
+#         # Recover Cartesian (x, y) from (RA, Dec, r) by inverting
+#         # convert_to_ra_dec_distance:
+#         #   ra  = atan2(y - L/2, x - L/2)  →  x = r_perp*cos(ra) + L/2
+#         #   dec = asin((z - L/2) / r)       →  y = r_perp*sin(ra) + L/2
+#         # where r_perp = r * cos(dec) is the transverse distance.
+#         r_vals = catalog.positions_rdd[2]
+#         ra_rad  = np.radians(ra)
+#         dec_rad = np.radians(dec)
+#         r_perp  = r_vals * np.cos(dec_rad)
+#         x_box   = r_perp * np.cos(ra_rad) + boxsize_use / 2.0
+#         y_box   = r_perp * np.sin(ra_rad) + boxsize_use / 2.0
+#         ngrid   = sys_map.shape[0]
+#         ix = np.floor(x_box / boxsize_use * ngrid).astype(int) % ngrid
+#         iy = np.floor(y_box / boxsize_use * ngrid).astype(int) % ngrid
+#         dn_over_n = sys_map[ix, iy]
+#         w_sys = np.clip(1.0 + dn_over_n, 0.01, 10.0)
+#         weights = catalog.weights * w_sys
+#         sys_weights = w_sys
+
+#     catalog.weights = weights
+#     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
+#     # Stash the input map + nside so _build_random_catalog can apply the
+#     # same w_sys to randoms when spec.apply_sys_to_randoms is set.
+#     catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
+#     if not periodic:
+#         catalog.metadata['transverse_multiplicative_nside'] = hp.npix2nside(len(sys_map))
+#     return catalog
 
 
 def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
@@ -887,6 +860,20 @@ def _generate_uniform_randoms_in_healpix_mask(
     
     return ra_rand, dec_rand, r_rand
 
+
+def _build_random_catalog_periodic(spec: ExperimentSpec, catalog: PreparedCatalog) -> tuple[np.ndarray, np.ndarray]:
+    seeds = _stage_seeds(spec, catalog.mock_idx)
+    n_randoms = int(spec.n_random_factor * catalog.positions_rdd.shape[1])
+    boxsize_use = catalog.metadata['boxsize_use']
+
+    print('boxsize use:', boxsize_use)
+
+    rng = np.random.default_rng(seeds['randoms'])
+    rand_positions = rng.uniform(0.0, boxsize_use, size=(3, n_randoms))
+
+    rand_weights = np.ones_like(rand_positions[0], dtype=float)
+
+    return rand_positions, rand_weights
 
 def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tuple[np.ndarray, np.ndarray]:
     seeds = _stage_seeds(spec, catalog.mock_idx)
@@ -1096,6 +1083,8 @@ def _compute_power_spectra(
     from pypower import CatalogFFTPower
 
     kedges = build_kedges(spec)
+
+    print('kedges in build spec is ', kedges)
     mu_wedges = build_mu_wedges(spec)
 
     # Compute wedges and poles simultaneously using los='z' (global plane-parallel),
@@ -1234,8 +1223,31 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
 
     print('Applying contamination...')
     catalog = _apply_contamination(spec, catalog, mock_idx)
-    rand_positions, rand_weights = _build_random_catalog(spec, catalog)
-    kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
+
+    if spec.mock_type == 'quijote':
+        rand_positions, rand_weights = _build_random_catalog_periodic(spec, catalog)  # Pre-build randoms for periodic box to ensure consistency across modes
+        print('Random positions (x,y,z) range:')
+        print('  x: [{:.2f}, {:.2f}]'.format(rand_positions[0].min(), rand_positions[0].max()))
+        print('  y: [{:.2f}, {:.2f}]'.format(rand_positions[1].min(), rand_positions[1].max()))
+        print('  z: [{:.2f}, {:.2f}]'.format(rand_positions[2].min(), rand_positions[2].max()))
+
+        print('rand weights are all ones:', np.all(rand_weights == 1.0))
+    else:
+        rand_positions, rand_weights = _build_random_catalog(spec, catalog)
+
+    # rand_positions = np.random.uniform(0, boxsize_use, size=(3, 1000))  # Placeholder randoms for testing
+# 
+
+    if spec.mock_type=='quijote':
+        print('Catalog positions (x,y,z) range after contamination:')
+        print('  x: [{:.2f}, {:.2f}]'.format(catalog.positions_rdd[0].min(), catalog.positions_rdd[0].max()))
+        print('  y: [{:.2f}, {:.2f}]'.format(catalog.positions_rdd[1].min(), catalog.positions_rdd[1].max()))
+        print('  z: [{:.2f}, {:.2f}]'.format(catalog.positions_rdd[2].min(), catalog.positions_rdd[2].max()))
+        print('Catalog weights range after contamination: [{:.3e}, {:.3e}]'.format(catalog.weights.min(), catalog.weights.max()))
+        kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
+
+    else:
+        kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
 
     return ExperimentResult(
         spec=spec,
