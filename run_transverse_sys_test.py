@@ -35,6 +35,8 @@ from pypower import setup_logging
 
 from pipeline import (
     ExperimentSpec,
+    _poles_to_wedges,
+    _wedges_to_poles,
     build_run_label,
     run_experiment_grid,
     save_experiment_result,
@@ -44,6 +46,12 @@ from pipeline import (
 from contamination import gen_controlled_transverse_map
 from desi_mocks import desi_mock
 from utils import convert_to_ra_dec_distance
+from celestial_diagnostics import (
+    plot_radec_distribution,
+    plot_comoving_distance_distribution,
+    plot_radec_distance_correlation,
+    plot_radec_r_comparison,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level globals — populated by parse_args() at startup.
@@ -54,7 +62,7 @@ SAVE_DIR      = 'data/plk/transverse_sys_test/default'
 FIG_DIR       = 'figures/transverse_sys_test/default'
 SYS_AMP       = 0.01
 SYS_SPEC_TYPE = 'power_law'
-SYS_ELL_MIN   = 6
+SYS_ELL_MIN   = 2
 SYS_ELL_MAX   = 16
 SYS_ELL_DELTA = None
 DS_FAC        = 20
@@ -62,7 +70,13 @@ NMESH         = 512
 K_MIN         = 0.006
 K_MAX         = 0.2
 DELTA_K       = 0.01
-ELLS          = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+Z_MIN         = 0.1        # Halfdome redshift range (lower bound)
+Z_MAX         = 0.4        # Halfdome redshift range (upper bound)
+# ELLS          = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+
+ELLS          = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+# ELLS          = (0, 2, 4, 6, 8)
+
 N_CLEAN_BINS  = 8
 NGRID_SYS     = 256
 NO_CACHE      = False
@@ -80,6 +94,7 @@ MEAN_CONSERVING_ADDITIVE = True   # Phase H1 fix: mean-conserving additive injec
 APPLY_SYS_TO_RANDOMS     = False  # Phase C9 control: apply w_sys to randoms too
 GAL_LAT_CUT_DEG          = 0.0   # Galactic latitude cut (degrees); 0 = no cut
 SYS_AMP_MODE             = 'rms'  # 'rms' (default) or 'mean'; for gaia_stellar, controls interpretation of sys_amp
+SYS_AMP_MULT_SCALE       = 1.0   # Scaling factor for multiplicative contamination effect (>1 = stronger)
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONTAMINATION_MODES = ['none', 'transverse_additive', 'transverse_multiplicative']
@@ -150,8 +165,8 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
             with_rsd=WITH_RSD,
             contamination_mode=contamination_mode,
             redshift_sel=True,
-            zmin=0.4,
-            zmax=1.0,
+            zmin=Z_MIN,
+            zmax=Z_MAX,
             k_min=K_MIN,
             k_max=K_MAX,
             delta_k=DELTA_K,
@@ -161,13 +176,14 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
             ells=ELLS,
             n_clean_bins=N_CLEAN_BINS,
             mu_binning_strategy='nonuniform',
-            los='z',
+            los='endpoint',
             sys_amp=SYS_AMP,
             sys_spec_type=SYS_SPEC_TYPE,
             sys_ell_min=SYS_ELL_MIN if SYS_SPEC_TYPE != 'gaia_stellar' else 0,
             sys_ell_max=SYS_ELL_MAX if SYS_SPEC_TYPE != 'gaia_stellar' else 0,
             sys_ell_delta=SYS_ELL_DELTA,
             sys_amp_mode=SYS_AMP_MODE,
+            sys_amp_mult_scale=SYS_AMP_MULT_SCALE,
             mean_conserving_additive=MEAN_CONSERVING_ADDITIVE,
             apply_sys_to_randoms=APPLY_SYS_TO_RANDOMS,
             gal_lat_cut_deg=GAL_LAT_CUT_DEG,
@@ -191,6 +207,7 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
         sys_ell_max=SYS_ELL_MAX if SYS_SPEC_TYPE != 'gaia_stellar' else 0,
         sys_ell_delta=SYS_ELL_DELTA,
         sys_amp_mode=SYS_AMP_MODE,
+        sys_amp_mult_scale=SYS_AMP_MULT_SCALE,
         mean_conserving_additive=MEAN_CONSERVING_ADDITIVE,
         apply_sys_to_randoms=APPLY_SYS_TO_RANDOMS,
         save_dir=SAVE_DIR,
@@ -261,13 +278,24 @@ def plot_pkmu_comparison(results: dict[str, dict], fig_dir: str) -> None:
         for mu_idx in range(nmu):
             mu_lab = (f'{mu_wedges[mu_idx]:.2f}' + r'$<\mu<$' +
                       f'{mu_wedges[mu_idx+1]:.2f}')
-            mean_pk = np.mean(pkmu[:, :, mu_idx], axis=0)
-            err_pk  = np.std(pkmu[:, :, mu_idx], axis=0) / np.sqrt(pkmu.shape[0])
-            ax.errorbar(kcen, kcen * mean_pk, yerr=kcen * err_pk,
-                        label=mu_lab, color=mu_colors[mu_idx],
-                        linewidth=2 if mu_idx == 0 else 1.2)
+            mean_pk = np.nanmean(pkmu[:, :, mu_idx], axis=0)
+            err_pk  = np.nanstd(pkmu[:, :, mu_idx], axis=0) / np.sqrt(np.isfinite(pkmu[:, :, mu_idx]).sum(axis=0).clip(1))
+            
+            # Only plot valid data points
+            valid = np.isfinite(mean_pk) & np.isfinite(err_pk) & (mean_pk > 0)
+            if np.any(valid):
+                ax.errorbar(kcen[valid], (kcen * mean_pk)[valid], yerr=(kcen * err_pk)[valid],
+                            label=mu_lab, color=mu_colors[mu_idx],
+                            linewidth=2 if mu_idx == 0 else 1.2)
         ax.set_xlabel('k [h/Mpc]', fontsize=11)
         ax.grid(alpha=0.2)
+
+        # Compute y-limits
+        if PLOT_YLIM_PS_MIN is not None and PLOT_YLIM_PS_MAX is not None:
+            ylim = (PLOT_YLIM_PS_MIN, PLOT_YLIM_PS_MAX)
+        if PLOT_YSCALE_PS == 'log':
+            ax.set_yscale('log')
+
     axes[0].set_ylabel(r'$k\,P(k,\mu)$ [$({\rm Mpc}/h)^2$]', fontsize=11)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.2),
@@ -411,6 +439,121 @@ def plot_pkmu_comparison(results: dict[str, dict], fig_dir: str) -> None:
     print(f'Saved: {fpath}')
 
 
+def plot_power_spectrum_multipoles(results: dict[str, dict], fig_dir: str) -> None:
+    """
+    Plot power spectrum multipoles (monopole, quadrupole, hexadecapole) 
+    reconstructed from wedges via wedges-to-poles inversion.
+    
+    Three panels: one per contamination mode (none, additive, multiplicative).
+    Each panel shows ℓ=0, 2, 4 with error bars.
+    """
+    from pipeline import _wedges_to_poles
+    
+    os.makedirs(fig_dir, exist_ok=True)
+    
+    clean_res = results['none']
+    kcen = clean_res['kcen'].real
+    mu_wedges = clean_res['mu_wedges']
+    
+    # Target multipoles
+    # target_ells = [0, 2, 4]
+    # ell_labels = {0: r'$P_0(k)$ (monopole)', 
+    #               2: r'$P_2(k)$ (quadrupole)', 
+    #               4: r'$P_4(k)$ (hexadecapole)'}
+    # ell_colors = {0: 'C0', 2: 'C1', 4: 'C2'}
+
+    # target_ells = [0, 2, 4, 6, 8, 10, 12, 14, 16]
+
+    # ell_labels = {0: r'$P_0(k)$ (monopole)', 
+    #               2: r'$P_2(k)$ (quadrupole)', 
+    #               4: r'$P_4(k)$ (hexadecapole)', 
+    #               6: r'$P_6(k)$', 
+    #               8: r'$P_8(k)$',
+    #               10: r'$P_{10}(k)$',
+    #               12: r'$P_{12}(k)$',
+    #               14: r'$P_{14}(k)$',
+    #               16: r'$P_{16}(k)$'}
+    # ell_colors = {0: 'C0', 2: 'C1', 4: 'C2', 6: 'C3', 8: 'C4', 10: 'C5', 12: 'C6', 14: 'C7', 16: 'C8'}
+    
+    target_ells = [1, 3, 5, 7, 9, 11, 13, 15]
+
+    ell_labels = {1: r'$P_1(k)$', 3: r'$P_3(k)$', 5: r'$P_5(k)$', 7: r'$P_7(k)$',
+                  9: r'$P_9(k)$', 11: r'$P_{11}(k)$', 13: r'$P_{13}(k)$', 15: r'$P_{15}(k)$'}
+    ell_colors = {1: 'C0', 3: 'C1', 5: 'C2', 7: 'C3', 9: 'C4', 11: 'C5', 13: 'C6', 15: 'C7'}
+
+    # Build figure with one panel per contamination mode
+    fig, axes = plt.subplots(1, len(CONTAMINATION_MODES), figsize=(4 * len(CONTAMINATION_MODES), 4.5),
+                             sharey=True)
+    if len(CONTAMINATION_MODES) == 1:
+        axes = [axes]
+    
+    for ax, mode in zip(axes, CONTAMINATION_MODES):
+        res = results[mode]
+        pkmu_all = res['all_pkmu'].real  # shape (nmock, nk, nmu)
+        
+        ax.set_title(MODE_LABELS[mode], fontsize=12)
+        
+        # For each mock, reconstruct multipoles from wedges
+        plk_all = []
+        for mock_idx in range(pkmu_all.shape[0]):
+            pkmu = pkmu_all[mock_idx]  # shape (nk, nmu)
+            plk = _wedges_to_poles(ELLS, pkmu, mu_wedges)  # shape (nk, nell)
+            plk_all.append(plk.real)
+        plk_all = np.array(plk_all)  # shape (nmock, nk, nell)
+        
+        # Plot each target multipole with robustness to NaN values
+        valid_data_ranges = []
+        for ell in target_ells:
+            if ell in ELLS:
+                ell_idx = list(ELLS).index(ell)
+                mean_ell = np.nanmean(plk_all[:, :, ell_idx], axis=0)
+                err_ell = np.nanstd(plk_all[:, :, ell_idx], axis=0) / np.sqrt(np.isfinite(plk_all[:, :, ell_idx]).sum(axis=0).clip(1))
+                
+                # Only plot valid data points
+                valid = np.isfinite(mean_ell)
+                if np.any(valid):
+                    ax.errorbar(kcen[valid], mean_ell[valid], yerr=err_ell[valid],
+                               label=ell_labels[ell], color=ell_colors[ell],
+                               linewidth=2, marker='o', markersize=4, capsize=3)
+                    valid_data_ranges.append(mean_ell[valid])
+        
+        ax.set_xlabel('k [h/Mpc]', fontsize=11)
+
+        if mode == 'none':
+            ax.set_ylabel(r'$P_\ell(k)$ [$({\rm Mpc}/h)^3$]', fontsize=11)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        
+
+        ax.set_ylim(1e3, 2e5)
+
+        # # Set y-limits adaptively based on valid data
+        # if valid_data_ranges:
+        #     all_valid = np.concatenate(valid_data_ranges)
+        #     if len(all_valid) > 0:
+        #         ymin, ymax = np.min(all_valid), np.max(all_valid)
+        #         ymin_padded = ymin / 3
+        #         ymax_padded = ymax * 3
+        #         ax.set_ylim(ymin_padded, ymax_padded)
+        #     else:
+        #         ax.set_ylim(1e2, 1e5)
+        # else:
+        #     ax.set_ylim(1e2, 1e5)
+        
+        ax.grid(alpha=0.3, which='both')
+        if mode == 'none':
+            ax.legend(fontsize=12, ncol=4, bbox_to_anchor=(1.5, 1.5), loc='upper center', frameon=True)
+    
+    fig.suptitle(f'Power Spectrum Multipoles | {NMOCK} mocks | run={RUN_NAME}\n'
+                 f'spec_type={SYS_SPEC_TYPE}, sys_amp={SYS_AMP}',
+                 fontsize=11, y=1.02)
+    # plt.tight_layout()
+    fpath = os.path.join(fig_dir, 'pkell_multipoles.png')
+    fig.savefig(fpath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {fpath}')
+
+
 def _load_sys_map_healpix(seed: int | None = None) -> np.ndarray:
     """Return the HEALPix contamination map matching the current globals.
 
@@ -479,6 +622,367 @@ def _load_sys_map_healpix(seed: int | None = None) -> np.ndarray:
         periodic=False,
         nside=256,
     )
+
+def plot_null_mu_bin_effect(results: dict[str, dict], fig_dir: str) -> None:
+    """
+    Plot the impact of nulling the lowest μ bin on recovered P_ℓ(k).
+
+    For each contaminated mode and ℓ ∈ {0, 2, 4}, shows:
+    - Top row (taller): clean, contaminated (regular), and contaminated with lowest μ nulled
+    - Bottom row (shorter): fractional deviation (nulled / clean), fixed y-range [1e-1, 1e1]
+    """
+    if 'none' not in results or results['none'].get('all_plk_null_lowest_mu') is None:
+        print('Skipping null μ-bin effect plot: clean mode missing or no nulled multipoles.')
+        return
+
+    plk_clean = results['none']['all_plk']  # (nmock, nell, nk)
+    plk_clean_avg = np.mean(plk_clean, axis=0)  # (nell, nk)
+    kcen = results['none']['kcen']
+    ells = results['none']['ells']
+
+
+    os.makedirs(fig_dir, exist_ok=True)
+
+    contam_modes = [
+        mode for mode in results
+        if mode != 'none' and results[mode].get('all_plk_null_lowest_mu') is not None
+    ]
+    if not contam_modes:
+        print('Skipping null μ-bin effect plot: no contaminated modes with nulled multipoles.')
+        return
+
+    target_ells = [ell for ell in ells if ell in [0, 2, 4]]
+    target_ell_indices = [list(ells).index(ell) for ell in target_ells]
+
+    n_ells = len(target_ells)
+    n_modes = len(contam_modes)
+
+    from matplotlib.gridspec import GridSpec
+
+    fig = plt.figure(figsize=(5 * n_ells, 5.4 * n_modes))
+    # For each mode: 2 rows (top taller, bottom shorter)
+    gs = GridSpec(
+        nrows=2 * n_modes,
+        ncols=n_ells,
+        figure=fig,
+        height_ratios=[3, 1] * n_modes,
+        hspace=0.18,
+        wspace=0.25,
+    )
+
+    for mode_row_idx, mode in enumerate(contam_modes):
+        plk_contam = results[mode]['all_plk']  # (nmock, nell, nk)
+        plk_null = results[mode]['all_plk_null_lowest_mu']  # (nmock, nell, nk)
+
+        plk_contam_avg = np.nanmean(plk_contam, axis=0)
+        plk_null_avg = np.nanmean(plk_null, axis=0)
+
+        top_row = 2 * mode_row_idx
+        bot_row = top_row + 1
+
+        for col_idx, (ell, ell_idx) in enumerate(zip(target_ells, target_ell_indices)):
+            ax_top = fig.add_subplot(gs[top_row, col_idx])
+            ax_bot = fig.add_subplot(gs[bot_row, col_idx], sharex=ax_top)
+
+            pk_clean = np.abs(plk_clean_avg[ell_idx, :])
+            pk_contam = np.abs(plk_contam_avg[ell_idx, :])
+            pk_null = np.abs(plk_null_avg[ell_idx, :])
+
+            valid_clean = np.isfinite(pk_clean) & (pk_clean > 0)
+            valid_contam = np.isfinite(pk_contam) & (pk_contam > 0)
+            valid_null = np.isfinite(pk_null) & (pk_null > 0)
+
+
+            clean_samples  = np.abs(plk_clean[:, ell_idx, :])    # (nmock, nk)
+            contam_samples = np.abs(plk_contam[:, ell_idx, :])   # (nmock, nk)
+            null_samples   = np.abs(plk_null[:, ell_idx, :])     # (nmock, nk)
+
+            # Means
+            pk_clean  = np.nanmean(clean_samples, axis=0)
+            pk_contam = np.nanmean(contam_samples, axis=0)
+            pk_null   = np.nanmean(null_samples, axis=0)
+
+            n_clean_eff  = np.sum(np.isfinite(clean_samples), axis=0)
+            n_contam_eff = np.sum(np.isfinite(contam_samples), axis=0)
+            n_null_eff   = np.sum(np.isfinite(null_samples), axis=0)
+
+            err_clean  = np.nanstd(clean_samples, axis=0, ddof=1) / np.sqrt(np.maximum(n_clean_eff, 1))
+            err_contam = np.nanstd(contam_samples, axis=0, ddof=1) / np.sqrt(np.maximum(n_contam_eff, 1))
+            err_null   = np.nanstd(null_samples, axis=0, ddof=1) / np.sqrt(np.maximum(n_null_eff, 1))
+
+            # --- Top panel ---
+            # if np.any(valid_clean):
+            #     ax_top.loglog(kcen[valid_clean], pk_clean[valid_clean], 'k-', linewidth=2, label='Clean', alpha=0.8)
+            # if np.any(valid_contam):
+            #     ax_top.loglog(kcen[valid_contam], pk_contam[valid_contam], 'C0--', linewidth=1.8, label='Contaminated', alpha=0.75)
+            # if np.any(valid_null):
+            #     ax_top.loglog(kcen[valid_null], pk_null[valid_null], 'C1:', linewidth=2.2, label='Contam (null lowest μ)', alpha=0.85)
+
+            valid_clean = np.isfinite(pk_clean) & (pk_clean > 0) & np.isfinite(err_clean)
+            ax_top.errorbar(kcen[valid_clean], pk_clean[valid_clean], yerr=err_clean[valid_clean],
+                            fmt='k-', lw=2, elinewidth=1, capsize=2, alpha=0.8, label='Clean')
+
+            valid_contam = np.isfinite(pk_contam) & (pk_contam > 0) & np.isfinite(err_contam)
+            ax_top.errorbar(kcen[valid_contam], pk_contam[valid_contam], yerr=err_contam[valid_contam],
+                            fmt='C0--', lw=1.8, elinewidth=1, capsize=2, alpha=0.75, label='Contaminated')
+
+            valid_null = np.isfinite(pk_null) & (pk_null > 0) & np.isfinite(err_null)
+            ax_top.errorbar(kcen[valid_null], pk_null[valid_null], yerr=err_null[valid_null],
+                            fmt='C1:', lw=2.2, elinewidth=1, capsize=2, alpha=0.85, label='Contam (null lowest μ)')
+
+
+            ax_top.set_xscale('log')
+
+            if mode_row_idx == 0:
+                ax_top.set_title(f'ℓ={ell}', fontsize=11, fontweight='bold')
+            if col_idx == 0:
+                ax_top.text(
+                    -0.32, 0.5, f'{mode}',
+                    transform=ax_top.transAxes, fontsize=10, fontweight='bold',
+                    rotation=90, va='center'
+                )
+
+            ax_top.set_ylabel(fr'$|P_{{{ell}}}(k)|$ [$(h/\mathrm{{Mpc}})^3$]', fontsize=10)
+            ax_top.grid(alpha=0.3, which='both')
+            if mode_row_idx == 0 and col_idx == 0:
+                ax_top.legend(fontsize=8, loc='best')
+
+            ax_top.set_yscale('log')
+
+            ax_top.set_ylim(1e3, 1e6)
+            plt.setp(ax_top.get_xticklabels(), visible=False)
+
+            # --- Bottom panel: fractional deviation (nulled/clean) ---
+            ratio_null = np.where(
+                np.isfinite(pk_clean) & (pk_clean > 1e-20),
+                pk_null / pk_clean,
+                np.nan
+            )
+
+            ratio_contam = np.where(
+                np.isfinite(pk_clean) & (pk_clean > 1e-20),
+                pk_contam / pk_clean,
+                np.nan
+            )
+
+
+            valid_ratio = np.isfinite(ratio_null) & (ratio_null > 0)
+
+            valid_ratio_contam = np.isfinite(ratio_contam) & (ratio_contam > 0)
+
+            if np.any(valid_ratio):
+
+                err_null_rel = err_null[valid_ratio] / pk_clean[valid_ratio]
+                err_clean_rel = err_clean[valid_ratio] / pk_clean[valid_ratio]
+                err_ratio = ratio_null[valid_ratio] * np.sqrt(err_null_rel**2 + err_clean_rel**2)
+
+                err_contam_rel = err_contam[valid_ratio_contam] / pk_clean[valid_ratio_contam]
+                err_ratio_contam = (pk_contam[valid_ratio_contam] / pk_clean[valid_ratio_contam]) * np.sqrt(err_contam_rel**2 + err_clean_rel**2)     
+
+                ax_bot.errorbar(kcen[valid_ratio], ratio_null[valid_ratio], yerr=err_ratio, fmt='C1', linewidth=1.7)
+
+                ax_bot.errorbar(kcen[valid_ratio_contam], ratio_contam[valid_ratio_contam], yerr=err_ratio_contam, fmt='C0', linewidth=1.7)
+
+                # ax_bot.semilogx(kcen[valid_ratio], ratio_null[valid_ratio], color='C1', linewidth=1.7)
+
+            ax_bot.axhline(1.0, color='red', linestyle='--', linewidth=1.0, alpha=0.65)
+            ax_bot.set_yscale('log')
+            ax_bot.set_ylim(1e-1, 1e1)  # fixed range requested
+            ax_bot.grid(alpha=0.25, which='both')
+            ax_bot.set_xlabel('k [h/Mpc]', fontsize=10)
+            if col_idx == 0:
+                ax_bot.set_ylabel('nulled / clean', fontsize=9)
+
+    fig.suptitle('Impact of Nulling Lowest μ Bin on Recovered P_ℓ(k)', fontsize=13, y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+
+    fpath = os.path.join(fig_dir, 'null_mu_bin_effect.png')
+    fig.savefig(fpath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {fpath}')
+
+    # Summary stats (unchanged)
+    print("\nNull μ-bin effect summary (ℓ ∈ {0, 2, 4}):")
+    print("-" * 70)
+    for mode in contam_modes:
+        plk_null = results[mode]['all_plk_null_lowest_mu']
+        plk_null_avg = np.nanmean(plk_null, axis=0)
+        plk_contam = results[mode]['all_plk']
+        plk_contam_avg = np.nanmean(plk_contam, axis=0)
+
+        print(f"\n{mode}:")
+        print(f"  {'ℓ':<4} {'Mean ratio':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        for ell, ell_idx in zip(target_ells, target_ell_indices):
+            ratio = np.abs(plk_null_avg[ell_idx, :]) / (np.abs(plk_clean_avg[ell_idx, :]) + 1e-20)
+            ratio_valid = ratio[np.isfinite(ratio) & (ratio > 0)]
+            if len(ratio_valid) > 0:
+                mean_r = np.mean(ratio_valid)
+                std_r = np.std(ratio_valid)
+                min_r = np.min(ratio_valid)
+                max_r = np.max(ratio_valid)
+                n_valid = len(ratio_valid)
+                n_total = len(ratio)
+                print(f"  {ell:<4} {mean_r:<12.4f} {std_r:<12.4f} {min_r:<12.4f} {max_r:<12.4f} ({n_valid}/{n_total} valid)")
+            else:
+                print(f"  {ell:<4} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} (no valid data)")
+    print("-" * 70)
+
+# def plot_null_mu_bin_effect(results: dict[str, dict], fig_dir: str) -> None:
+#     """
+#     Plot the impact of nulling the lowest μ bin on recovered P_ℓ(k).
+    
+#     For each contaminated mode and ℓ ∈ {0, 2, 4}, shows:
+#     - Main panel: clean, contaminated (regular), and contaminated with lowest μ nulled
+#     - Inset: ratio of (nulled / clean)
+    
+#     Parameters
+#     ----------
+#     results : dict[str, dict]
+#         Dict mapping mode -> result dict with keys: kcen, all_plk, all_plk_null_lowest_mu, ells, label
+#     fig_dir : str
+#         Output directory for figures
+#     """
+#     if 'none' not in results or results['none'].get('all_plk_null_lowest_mu') is None:
+#         print('Skipping null μ-bin effect plot: clean mode missing or no nulled multipoles.')
+#         return
+    
+#     plk_clean = results['none']['all_plk']  # (nmock, nell, nk)
+#     plk_clean_avg = np.mean(plk_clean, axis=0)  # (nell, nk)
+#     kcen = results['none']['kcen']
+#     ells = results['none']['ells']
+    
+#     os.makedirs(fig_dir, exist_ok=True)
+    
+#     # Determine which contaminated modes have nulled multipoles
+#     contam_modes = [mode for mode in results if mode != 'none' 
+#                     and results[mode].get('all_plk_null_lowest_mu') is not None]
+    
+#     if not contam_modes:
+#         print('Skipping null μ-bin effect plot: no contaminated modes with nulled multipoles.')
+#         return
+    
+#     # Target only ℓ=0, 2, 4
+#     target_ells = [ell for ell in ells if ell in [0, 2, 4]]
+#     target_ell_indices = [list(ells).index(ell) for ell in target_ells]
+    
+#     n_ells = len(target_ells)
+#     n_modes = len(contam_modes)
+    
+#     # Create figure with n_modes rows × n_ells columns
+#     fig, axes = plt.subplots(n_modes, n_ells, figsize=(5*n_ells, 4.5*n_modes), sharey='col')
+#     if n_modes == 1:
+#         axes = axes.reshape(1, -1)
+#     elif n_ells == 1:
+#         axes = axes.reshape(-1, 1)
+    
+#     ell_colors = {0: 'C0', 2: 'C1', 4: 'C2'}
+    
+#     for mode_row_idx, mode in enumerate(contam_modes):
+#         plk_contam = results[mode]['all_plk']  # (nmock, nell, nk)
+#         plk_null = results[mode]['all_plk_null_lowest_mu']  # (nmock, nell, nk)
+        
+#         plk_contam_avg = np.nanmean(plk_contam, axis=0)  # (nell, nk)
+#         plk_null_avg = np.nanmean(plk_null, axis=0)  # (nell, nk)
+        
+#         for col_idx, (ell, ell_idx) in enumerate(zip(target_ells, target_ell_indices)):
+#             ax = axes[mode_row_idx, col_idx]
+            
+#             pk_clean = np.abs(plk_clean_avg[ell_idx, :])
+#             pk_contam = np.abs(plk_contam_avg[ell_idx, :])
+#             pk_null = np.abs(plk_null_avg[ell_idx, :])
+            
+#             # Filter out NaN and inf values for robustness with small nmesh
+#             valid_clean = np.isfinite(pk_clean) & (pk_clean > 0)
+#             valid_contam = np.isfinite(pk_contam) & (pk_contam > 0)
+#             valid_null = np.isfinite(pk_null) & (pk_null > 0)
+            
+#             # Main panel: three curves (only plot valid data)
+#             if np.any(valid_clean):
+#                 ax.loglog(kcen[valid_clean], pk_clean[valid_clean], 'k-', linewidth=2, label='Clean', alpha=0.8)
+#             if np.any(valid_contam):
+#                 ax.loglog(kcen[valid_contam], pk_contam[valid_contam], 'C0--', linewidth=1.8, label='Contaminated', alpha=0.7)
+#             if np.any(valid_null):
+#                 ax.loglog(kcen[valid_null], pk_null[valid_null], 'C1:', linewidth=2.2, label='Contaminated (null lowest μ)', alpha=0.8)
+            
+#             ax.set_xlabel('k [h/Mpc]', fontsize=10)
+#             ax.set_ylabel(f'$|P_{ell}(k)|$ [$(h/\\mathrm{{Mpc}})^3$]', fontsize=10)
+            
+#             if mode_row_idx == 0:
+#                 ax.set_title(f'ℓ={ell}', fontsize=11, fontweight='bold')
+            
+#             if col_idx == 0:
+#                 ax.text(-0.35, 0.5, f'{mode}', transform=ax.transAxes,
+#                        fontsize=10, fontweight='bold', rotation=90, va='center')
+            
+#             ax.grid(alpha=0.3, which='both')
+#             if mode_row_idx == 0 and col_idx == 0:
+#                 ax.legend(fontsize=8, loc='best')
+            
+#             # Inset: ratio panel (nulled / clean)
+#             from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+#             axins = inset_axes(ax, width='35%', height='35%', loc='lower left', borderpad=0.8)
+            
+#             # Compute ratio, handling division by zero robustly
+#             ratio_null = np.where(
+#                 np.isfinite(pk_clean) & (pk_clean > 1e-20),
+#                 pk_null / pk_clean,
+#                 np.nan
+#             )
+            
+#             # Plot only valid ratio values
+#             valid_ratio = np.isfinite(ratio_null) & (ratio_null > 0)
+#             if np.any(valid_ratio):
+#                 axins.semilogx(kcen[valid_ratio], ratio_null[valid_ratio], 'C1-', linewidth=1.5, alpha=0.8)
+            
+#             axins.axhline(1.0, color='red', linestyle='--', linewidth=1, alpha=0.5)
+#             axins.set_xlabel('k', fontsize=8)
+#             axins.set_ylabel('Ratio', fontsize=8)
+#             axins.tick_params(labelsize=7)
+#             axins.grid(alpha=0.2, which='both')
+            
+#             # Set reasonable y-limits for inset, handling all-NaN case
+#             valid_ratio_filtered = ratio_null[(valid_ratio) & (ratio_null >= 0.1) & (ratio_null <= 10)]
+#             if len(valid_ratio_filtered) > 0:
+#                 ratio_min = np.min(valid_ratio_filtered)
+#                 ratio_max = np.max(valid_ratio_filtered)
+#                 axins.set_ylim(max(0.5, ratio_min * 0.8), min(2.0, ratio_max * 1.2))
+#             else:
+#                 axins.set_ylim(0.5, 2.0)
+    
+#     fig.suptitle('Impact of Nulling Lowest μ Bin on Recovered P_ℓ(k)', fontsize=13, y=0.995)
+#     plt.tight_layout()
+    
+#     fpath = os.path.join(fig_dir, 'null_mu_bin_effect.png')
+#     fig.savefig(fpath, dpi=150, bbox_inches='tight')
+#     plt.close(fig)
+#     print(f'Saved: {fpath}')
+    
+#     # Print summary stats per mode and ℓ
+#     print("\nNull μ-bin effect summary (ℓ ∈ {0, 2, 4}):")
+#     print("-" * 70)
+#     for mode in contam_modes:
+#         plk_null = results[mode]['all_plk_null_lowest_mu']
+#         plk_null_avg = np.nanmean(plk_null, axis=0)
+#         plk_contam = results[mode]['all_plk']
+#         plk_contam_avg = np.nanmean(plk_contam, axis=0)
+        
+#         print(f"\n{mode}:")
+#         print(f"  {'ℓ':<4} {'Mean ratio':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+#         for ell, ell_idx in zip(target_ells, target_ell_indices):
+#             ratio = np.abs(plk_null_avg[ell_idx, :]) / (np.abs(plk_clean_avg[ell_idx, :]) + 1e-20)
+#             # Filter out invalid values for stats
+#             ratio_valid = ratio[np.isfinite(ratio) & (ratio > 0)]
+#             if len(ratio_valid) > 0:
+#                 mean_r = np.mean(ratio_valid)
+#                 std_r = np.std(ratio_valid)
+#                 min_r = np.min(ratio_valid)
+#                 max_r = np.max(ratio_valid)
+#                 n_valid = len(ratio_valid)
+#                 n_total = len(ratio)
+#                 print(f"  {ell:<4} {mean_r:<12.4f} {std_r:<12.4f} {min_r:<12.4f} {max_r:<12.4f} ({n_valid}/{n_total} valid)")
+#             else:
+#                 print(f"  {ell:<4} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} (no valid data)")
+#     print("-" * 70)
 
 
 def plot_sys_map(fig_dir: str) -> None:
@@ -821,13 +1325,13 @@ def plot_catalog_positions_with_masking(fig_dir: str) -> None:
     
     # Apply redshift selection (same as pipeline)
     redshift_mask = np.ones_like(z_array, dtype=bool)
-    redshift_mask &= z_array > 0.4
-    redshift_mask &= z_array < 1.0
+    redshift_mask &= z_array > Z_MIN
+    redshift_mask &= z_array < Z_MAX
     ra = ra[redshift_mask]
     dec = dec[redshift_mask]
     r_values = r_values[redshift_mask]
     z_array = z_array[redshift_mask]
-    print(f'  After redshift selection [0.4, 1.0]: {len(ra):,} galaxies')
+    print(f'  After redshift selection [{Z_MIN}, {Z_MAX}]: {len(ra):,} galaxies')
     
     # Cache original z-distribution BEFORE masking (same as pipeline does)
     # This ensures randoms maintain constant comoving density even when data is masked
@@ -1391,7 +1895,7 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
     dm.halfdome_mock_basedir = DEFAULT_HALFDOME_BASEDIR
     galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=1_000_000)
 
-    redshift_sel = (redshift > 0.4) & (redshift < 1.0)
+    redshift_sel = (redshift > Z_MIN) & (redshift < Z_MAX)
     galpos = galpos[redshift_sel]
     redshift = redshift[redshift_sel]
     
@@ -1491,21 +1995,25 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
         randoms_positions1=rand_array,
         randoms_weights1=rand_weights,
         nmesh=NMESH,
-        los='z',
+        los='endpoint',
         position_type='rdd',
         resampler='tsc',
         dtype='f8',
         ells=ELLS,
-        edges=edges,
+        edges=kedges,
         interlacing=2,
         shotnoise=None,
         mpiroot=0,
     )
     
-    pkmu = result.wedges.get_power().real
-    kcen = result.wedges.k[:, 0].real
-    nmu = len(mu_wedges) - 1
+    plk = result.poles.get_power()                      # shape usually (nell, nk)
+    kcen = result.poles.k                         # shape (nk,)
+    plk_kell = np.moveaxis(plk, 0, 1)            # -> (nk, nell)
     
+    pkmu = _poles_to_wedges(ELLS, plk_kell, mu_wedges)  # (nk, nmu)
+    
+
+    nmu = len(mu_wedges) - 1
     # Plot k*P(k,μ) for each mu wedge
     fig = plt.figure(figsize=(6, 5))
     cmap = plt.get_cmap('jet')
@@ -1536,10 +2044,10 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
 
 def parse_args():
     """Parse CLI arguments and update module globals."""
-    global RUN_NAME, NMOCK, SAVE_DIR, FIG_DIR, SYS_AMP, SYS_SPEC_TYPE, SYS_AMP_MODE
+    global RUN_NAME, NMOCK, SAVE_DIR, FIG_DIR, SYS_AMP, SYS_SPEC_TYPE, SYS_AMP_MODE, SYS_AMP_MULT_SCALE
     global SYS_ELL_MIN, SYS_ELL_MAX, SYS_ELL_DELTA, DS_FAC, NMESH, NO_CACHE, CLEAR
-    global WITH_RSD, MOCK_TYPE, N_SAMPLE, TARGET_NBAR, PLOT_YSCALE, PLOT_YLIM_MIN, PLOT_YLIM_MAX, VERBOSE_LOGGING
-    global K_MIN, K_MAX, DELTA_K, MODES_TO_RUN, MEAN_CONSERVING_ADDITIVE, APPLY_SYS_TO_RANDOMS, GAL_LAT_CUT_DEG
+    global WITH_RSD, MOCK_TYPE, N_SAMPLE, TARGET_NBAR, PLOT_YSCALE, PLOT_YLIM_MIN, PLOT_YLIM_MAX, PLOT_YSCALE_PS, PLOT_YLIM_PS_MIN, PLOT_YLIM_PS_MAX, VERBOSE_LOGGING
+    global K_MIN, K_MAX, DELTA_K, Z_MIN, Z_MAX, MODES_TO_RUN, MEAN_CONSERVING_ADDITIVE, APPLY_SYS_TO_RANDOMS, GAL_LAT_CUT_DEG
 
     p = argparse.ArgumentParser(
         description='Controlled transverse systematic test on Quijote mocks.',
@@ -1558,6 +2066,8 @@ def parse_args():
                    help='Amplitude of the systematic map. For gaia_stellar, interpretation depends on --sys-amp-mode.')
     p.add_argument('--sys-amp-mode', default='mean', choices=['rms', 'mean'],
                    help='For gaia_stellar: "rms"=scale to RMS amplitude (default), "mean"=scale to mean value (contamination fraction).')
+    p.add_argument('--sys-amp-mult-scale', type=float, default=1.0,
+                   help='Scaling factor for multiplicative contamination effect. >1 makes multiplicative effect stronger at fixed sys_amp.')
     p.add_argument('--nmock',     type=int,   default=5,
                    help='Number of Quijote mocks to average over.')
     p.add_argument('--ds-fac',    type=int,   default=20,
@@ -1570,6 +2080,10 @@ def parse_args():
                    help='Maximum k for power spectrum binning [h/Mpc].')
     p.add_argument('--delta-k',   type=float, default=0.01,
                    help='k bin width for power spectrum binning [h/Mpc].')
+    p.add_argument('--z-min',     type=float, default=0.4,
+                   help='Minimum redshift for halfdome mock (ignored for quijote).')
+    p.add_argument('--z-max',     type=float, default=1.0,
+                   help='Maximum redshift for halfdome mock (ignored for quijote).')
     p.add_argument('--no-cache',  action='store_true',
                    help='Force recompute even if a cached npz already exists.')
     p.add_argument('--clear',  action='store_true',
@@ -1587,6 +2101,14 @@ def parse_args():
                    help='Fixed lower y-limit for ratio plots (None = adaptive).')
     p.add_argument('--plot-ylim-max', type=float, default=None,
                    help='Fixed upper y-limit for ratio plots (None = adaptive).')
+
+    p.add_argument('--plot-ylim-ps-min', type=float, default=None,
+                   help='Fixed lower y-limit for power spectrum plots (None = adaptive).')
+    p.add_argument('--plot-ylim-ps-max', type=float, default=None,
+                   help='Fixed upper y-limit for power spectrum plots (None = adaptive).')
+    
+    p.add_argument('--plot-yscale-ps', default='log', choices=['log', 'linear'],
+                   help='Y-axis scale for power spectrum plots.')
     p.add_argument('--verbose-logging', action='store_true',
                    help='Enable verbose logging from pypower (useful for debugging power spectrum computation).')
     p.add_argument('--target-nbar', type=float, default=None,
@@ -1613,17 +2135,20 @@ def parse_args():
         p.error('--ell-delta is required when --spec-type=delta')
 
     # Update module globals
-    RUN_NAME      = args.run_name
-    NMOCK         = args.nmock
-    SYS_AMP       = args.sys_amp
-    SYS_SPEC_TYPE = args.spec_type
-    SYS_AMP_MODE  = args.sys_amp_mode
-    SYS_ELL_DELTA = args.ell_delta
+    RUN_NAME           = args.run_name
+    NMOCK              = args.nmock
+    SYS_AMP            = args.sys_amp
+    SYS_SPEC_TYPE      = args.spec_type
+    SYS_AMP_MODE       = args.sys_amp_mode
+    SYS_AMP_MULT_SCALE = args.sys_amp_mult_scale
+    SYS_ELL_DELTA      = args.ell_delta
     DS_FAC        = args.ds_fac
     NMESH         = args.nmesh
     K_MIN         = args.k_min
     K_MAX         = args.k_max
     DELTA_K       = args.delta_k
+    Z_MIN         = args.z_min
+    Z_MAX         = args.z_max
     NO_CACHE      = args.no_cache
     CLEAR         = args.clear
     WITH_RSD      = args.with_rsd
@@ -1633,6 +2158,9 @@ def parse_args():
     PLOT_YSCALE   = args.plot_yscale
     PLOT_YLIM_MIN = args.plot_ylim_min
     PLOT_YLIM_MAX = args.plot_ylim_max
+    PLOT_YSCALE_PS = args.plot_yscale_ps
+    PLOT_YLIM_PS_MIN = args.plot_ylim_ps_min
+    PLOT_YLIM_PS_MAX = args.plot_ylim_ps_max
     VERBOSE_LOGGING = args.verbose_logging
     MODES_TO_RUN  = args.modes  # None means all
     MEAN_CONSERVING_ADDITIVE = not args.legacy_additive
@@ -1653,18 +2181,90 @@ def run_or_load(spec: ExperimentSpec, nmock: int) -> dict:
     if os.path.exists(out_path) and not NO_CACHE:
         print(f'[{label}] Loading cached result from {out_path}')
         dat = np.load(out_path)
-        return {'kcen': dat['kcen'], 'all_pkmu': dat['all_pkmu'], 'mu_wedges': dat['mu_wedges'], 'label': label}
+        result_dict = {
+            'kcen': dat['kcen'],
+            'all_pkmu': dat['all_pkmu'],
+            'all_plk': dat['all_plk'],
+            'mu_wedges': dat['mu_wedges'],
+            'ells': np.atleast_1d(dat['ells']),
+            'label': label,
+        }
+        # Include nulled multipoles if available
+        if 'all_plk_null_lowest_mu' in dat:
+            result_dict['all_plk_null_lowest_mu'] = dat['all_plk_null_lowest_mu']
+        return result_dict
 
     print(f'\n[{label}] Running {nmock} mocks...')
     result = run_experiment_grid(spec, nmock=nmock)
     save_experiment_result(result)
     print(f'[{label}] Saved to {out_path}')
-    return {
+    result_dict = {
         'kcen': result.kcen,
         'all_pkmu': result.all_pkmu,
+        'all_plk': result.all_plk,
         'mu_wedges': result.mu_wedges,
-        'label': label,
+        'ells': np.asarray(result.spec.ells),
+        'label': result.label,
     }
+    if result.all_plk_null_lowest_mu is not None:
+        result_dict['all_plk_null_lowest_mu'] = result.all_plk_null_lowest_mu
+    return result_dict
+
+
+def plot_halfdome_celestial_diagnostics(fig_dir: str) -> None:
+    """
+    Generate celestial coordinate (RA/DEC/r) diagnostics for halfdome catalog.
+    
+    Loads and visualizes the RA/DEC/r coordinates (position_type='rdd') that are 
+    actually used in power spectrum calculations, showing:
+    - RA/DEC distributions on the celestial sphere
+    - Radial distance distribution
+    - Correlations between coordinates
+    - Sky coverage pattern
+    """
+    if MOCK_TYPE != 'halfdome':
+        return  # Only for halfdome
+    
+    os.makedirs(fig_dir, exist_ok=True)
+    
+    print('\n[Celestial diagnostics] Generating RA/DEC/r visualizations...')
+    
+    try:
+        dm = desi_mock()
+        dm.halfdome_mock_basedir = DEFAULT_HALFDOME_BASEDIR
+        
+        # ── Load clean halfdome catalog for mock 0 ────────────────────────────
+        mock_idx = 0
+        galpos_clean, redshift_clean = dm.load_halfdome_mock(mock_idx, n_sample=N_SAMPLE, seed=42)
+        
+        # Use nominal boxsize initially to compute RA/DEC/r
+        nominal_boxsize = 1000.0
+        ra_clean, dec_clean, r_clean = convert_to_ra_dec_distance(galpos_clean, nominal_boxsize, center_offset_mpc=0.0)
+        r_clean_values = np.asarray(r_clean.value if hasattr(r_clean, 'value') else r_clean)
+        
+        # Use maximum r value as the effective boxsize for reference
+        max_r = np.max(r_clean_values)
+        print(f'  Clean catalog: {len(ra_clean):,} objects, max distance: {max_r:.1f} Mpc/h')
+        
+        # ── Generate diagnostic plots ─────────────────────────────────────────
+        plot_radec_distribution(ra_clean, dec_clean, fig_dir, '_halfdome_clean', 
+                               title_suffix='(halfdome clean catalog)')
+        print(f'    Saved RA/DEC distribution')
+        
+        plot_comoving_distance_distribution(r_clean_values, fig_dir, '_halfdome_clean',
+                                           title_suffix='(halfdome clean catalog)')
+        print(f'    Saved distance distribution')
+        
+        plot_radec_distance_correlation(ra_clean, dec_clean, r_clean_values, fig_dir, 
+                                        '_halfdome_clean', title_suffix='(halfdome clean catalog)')
+        print(f'    Saved RA/DEC/r correlation plot')
+        
+        print('  ✓ Celestial coordinate diagnostics complete')
+        
+    except Exception as e:
+        print(f'  ✗ Error generating celestial diagnostics: {e}')
+        import traceback
+        traceback.print_exc()
 
 
 def main():
@@ -1707,8 +2307,8 @@ def main():
     print('Generating contamination field P(k,μ) power spectrum...')
     if MOCK_TYPE == 'quijote':
         plot_contaminant_pkmu(FIG_DIR)
-    elif MOCK_TYPE == 'halfdome':
-        plot_contaminant_pkmu_halfdome(FIG_DIR)
+    # elif MOCK_TYPE == 'halfdome':
+        # plot_contaminant_pkmu_halfdome(FIG_DIR)
 
     print('Generating galaxy density visualization...')
     if MOCK_TYPE == 'quijote':
@@ -1716,7 +2316,8 @@ def main():
     elif MOCK_TYPE == 'halfdome':
         plot_density_distribution_healpix(FIG_DIR)
         plot_mask_and_contamination_diagnostics(FIG_DIR)
-        plot_catalog_positions_with_masking(FIG_DIR)
+        # plot_catalog_positions_with_masking(FIG_DIR)
+        # plot_halfdome_celestial_diagnostics(FIG_DIR)
 
     active_modes = MODES_TO_RUN if MODES_TO_RUN is not None else CONTAMINATION_MODES
     results = {}
@@ -1729,6 +2330,8 @@ def main():
         print('Skipping ratio plots (--modes did not include "none").')
     else:
         plot_pkmu_comparison(results, FIG_DIR)
+        plot_power_spectrum_multipoles(results, FIG_DIR)
+        plot_null_mu_bin_effect(results, FIG_DIR)
     print(f'\nDone. Figures saved to {FIG_DIR}/')
 
 

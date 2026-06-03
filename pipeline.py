@@ -59,8 +59,8 @@ class ExperimentSpec:
     sfd_std: float = 0.01
     dust_alpha: float = -10.0
     redshift_sel: bool = True
-    zmin: float = 0.4
-    zmax: float = 1.0
+    zmin: float = 0.1
+    zmax: float = 0.4
     replicate: bool = False
     rep_fac: int = 1
     ds_fac: int = 5
@@ -75,7 +75,7 @@ class ExperimentSpec:
     mu_wedges: tuple[float, ...] | None = None
     mu_binning_strategy: str = 'nonuniform'
     n_clean_bins: int = 8
-    ells: tuple[int, ...] = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+    ells: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
     nmesh: int = 512
     boxsize: float = 1000.0
     n_random_factor: int = 5
@@ -103,6 +103,10 @@ class ExperimentSpec:
     # For gaia_stellar spec_type: 'rms'=scale to RMS amplitude (default),
     # 'mean'=scale to mean value (contamination fraction)
     sys_amp_mode: str = 'rms'
+    # Multiplicative scaling factor: scales the weight effect relative to additive.
+    # E.g., sys_amp_mult_scale=2.0 makes multiplicative effects 2x stronger at fixed sys_amp.
+    # For multiplicative: w_sys = 1 + sys_amp_mult_scale * sys_map, vs additive: n_inject ~ sys_amp * n_gal
+    sys_amp_mult_scale: float = 1.0
     # Mean-conserving additive injection: in negative-lobe pixels, *remove*
     # existing galaxies (probabilistically) in addition to adding sources in
     # positive lobes. Preserves total n_gal and the input angular C_l (no
@@ -139,9 +143,11 @@ class ExperimentResult:
     all_pkmu: np.ndarray
     all_plk: np.ndarray
     mu_wedges: np.ndarray
+    shot_noise: float
     output_path: str | None = None
     label: str | None = None
     run_metadata: dict[str, Any] = field(default_factory=dict)
+    all_plk_null_lowest_mu: np.ndarray | None = None  # P_ℓ(k) with lowest μ bin nulled
 
 
 def _slug_number(value: float | int) -> str:
@@ -198,6 +204,8 @@ def build_run_label(spec: ExperimentSpec) -> str:
             parts.append(f'ldelta{spec.sys_ell_delta}')
         else:
             parts.append(f'lmax{spec.sys_ell_max}')
+        if spec.sys_amp_mult_scale != 1.0:
+            parts.append(f'multscale{_slug_number(spec.sys_amp_mult_scale)}')
     if spec.redshift_sel:
         parts.append(f'z{_slug_number(spec.zmin)}-{_slug_number(spec.zmax)}')
     if spec.replicate:
@@ -232,8 +240,8 @@ def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
         'sfd_std': 0.01,
         'dust_alpha': -10.0,
         'redshift_sel': True,
-        'zmin': 0.4,
-        'zmax': 1.0,
+        'zmin': 0.1,
+        'zmax': 0.4,
         'replicate': False,
         'rep_fac': 1,
         'ds_fac': 5,
@@ -244,7 +252,7 @@ def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
         'delta_k': 0.01,
         'mu_binning_strategy': 'nonuniform',
         'n_clean_bins': 8,
-        'ells': (0, 2, 4, 6, 8, 10, 12, 14, 16),
+        'ells': (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
         'nmesh': 512,
         'seed': 42,
         'quijote_geometry': 'full_cube' if mock_type_norm == 'quijote' else 'replicated',
@@ -636,6 +644,13 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     rng = np.random.default_rng(seeds['stellar_map'])
 
     if not periodic:
+        # ──────────────────────────────────────────────────────────────────────
+        # HALFDOME LIGHTCONE PATH: Handle positive lobe injection + (optionally)
+        # negative lobe removal for mean-conserving additive systematics
+        # ──────────────────────────────────────────────────────────────────────
+        nside_map = hp.npix2nside(len(sys_map))
+        
+        # ── Phase 1: Inject galaxies in positive lobe ───────────────────────
         positive_map = np.clip(sys_map, 0.0, None)
         total_weight = positive_map.sum()
         if total_weight > 0:
@@ -658,6 +673,33 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
         print('injected rmin/rmax:', galpos_inj[2].min(), galpos_inj[2].max())
         print('catalog ra/dec min/max:', catalog.positions_rdd[0].min(), catalog.positions_rdd[0].max(), catalog.positions_rdd[1].min(), catalog.positions_rdd[1].max())
         print('injected ra/dec min/max:', galpos_inj[0].min(), galpos_inj[0].max(), galpos_inj[1].min(), galpos_inj[1].max())
+
+        # ── Phase 2: Remove galaxies in negative lobe (if mean_conserving) ──
+        removal_mask = np.ones(n_gal, dtype=bool)
+        n_removed = 0
+        
+        if spec.mean_conserving_additive:
+            negative_map = np.clip(-sys_map, 0.0, None)
+            max_removal_prob = negative_map.max()
+            
+            if max_removal_prob > 0:
+                # Convert galaxy positions to HEALPix pixel indices
+                ra_gal = catalog.positions_rdd[0]
+                dec_gal = catalog.positions_rdd[1]
+                theta_gal = np.radians(90.0 - dec_gal)  # Dec to theta
+                phi_gal = np.radians(ra_gal)
+                pix_gal = hp.ang2pix(nside_map, theta_gal, phi_gal, nest=False)
+                
+                # Compute removal probability for each galaxy based on local map value
+                removal_probs = negative_map[pix_gal] / max_removal_prob
+                
+                # Probabilistically mark galaxies for removal
+                u_remove = rng.uniform(0.0, 1.0, size=n_gal)
+                removal_mask = u_remove >= removal_probs  # Keep if u >= prob
+                n_removed = np.sum(~removal_mask)
+                
+                print(f'Mean-conserving removal: {n_removed} galaxies marked for removal '
+                      f'({100.0 * n_removed / n_gal:.2f}% of catalog)')
 
     else:
         # Periodic 2D FFT path: sample positions uniformly in transverse plane,
@@ -694,6 +736,12 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     print('positions rdd has shape', catalog.positions_rdd.shape)
     print('inject positions has shape', galpos_inj.shape)
 
+    # Apply removal mask to existing catalog (halfdome only)
+    if not periodic and spec.mean_conserving_additive and n_removed > 0:
+        catalog.positions_rdd = catalog.positions_rdd[:, removal_mask]
+        catalog.weights = catalog.weights[removal_mask]
+        print(f'After removal: catalog has {catalog.positions_rdd.shape[1]} galaxies')
+
     catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj], axis=1)
 
     print("catalog.positions_rdd now has shape ", catalog.positions_rdd.shape)
@@ -711,29 +759,33 @@ def _apply_transverse_multiplicative_sys(spec: ExperimentSpec, catalog: Prepared
     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
 
     sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
+    
+    # Scale the systematic map by sys_amp_mult_scale to control relative strength of multiplicative effect
+    sys_map_scaled = sys_map * spec.sys_amp_mult_scale
 
     if not periodic:
         ra = catalog.positions_rdd[0]
         dec = catalog.positions_rdd[1]
-        nside_map = hp.npix2nside(len(sys_map))
-        weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map, nside=nside_map)
+        nside_map = hp.npix2nside(len(sys_map_scaled))
+        weights, sys_weights = modify_fkp_weights(ra, dec, catalog.weights, sys_map_scaled, nside=nside_map)
         catalog.metadata['transverse_multiplicative_nside'] = nside_map
     else:
         # positions_rdd stores raw Cartesian (x, y, z) for periodic boxes —
         # no RA/Dec inversion needed
         x_box = catalog.positions_rdd[0]
         y_box = catalog.positions_rdd[1]
-        ngrid = sys_map.shape[0]
+        ngrid = sys_map_scaled.shape[0]
         ix = np.floor(x_box / boxsize_use * ngrid).astype(int) % ngrid
         iy = np.floor(y_box / boxsize_use * ngrid).astype(int) % ngrid
-        dn_over_n = sys_map[ix, iy]
+        dn_over_n = sys_map_scaled[ix, iy]
         w_sys = np.clip(1.0 + dn_over_n, 0.01, 10.0)
         weights = catalog.weights * w_sys
         sys_weights = w_sys
 
     catalog.weights = weights
     catalog.metadata['transverse_multiplicative_sys_weights'] = sys_weights
-    catalog.metadata['transverse_multiplicative_sys_map'] = sys_map
+    catalog.metadata['transverse_multiplicative_sys_map'] = sys_map_scaled
+    catalog.metadata['transverse_multiplicative_sys_amp_mult_scale'] = spec.sys_amp_mult_scale
     return catalog
 
 def _apply_contamination(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
@@ -1034,6 +1086,61 @@ def _poles_to_wedges(ells, plk_arr: np.ndarray, mu_wedges: np.ndarray) -> np.nda
     return pkmu
 
 
+def _wedges_to_poles(ells, pkmu: np.ndarray, mu_wedges: np.ndarray) -> np.ndarray:
+    """
+    Convert power spectrum μ-wedges back to multipoles via least-squares inversion.
+
+    Inverts the relationship: P(k, μ₁<μ<μ₂) = Σ_ℓ P_ℓ(k) × W_ℓ(μ₁, μ₂)
+
+    For each k independently, solves: W · P_poles = P_wedges
+    to recover P_poles via W^{-1}.
+
+    Parameters
+    ----------
+    ells : sequence of int, shape (nell,)
+    pkmu : ndarray, shape (nk, nmu) — power in wedges indexed as [k, mu_wedge]
+    mu_wedges : ndarray, shape (nmu+1,) — μ bin edges
+
+    Returns
+    -------
+    plk_arr : ndarray, shape (nk, nell) — multipoles indexed as [k, ell]
+    """
+    from scipy.special import legendre as Leg
+
+    nmu = len(mu_wedges) - 1
+    nell = len(ells)
+    nk = pkmu.shape[0]
+    plk_arr = np.zeros((nk, nell), dtype=complex)
+
+    # Build window matrix W for this mu_wedges configuration
+    W = np.zeros((nmu, nell))
+    for mu_idx in range(nmu):
+        mu1, mu2 = mu_wedges[mu_idx], mu_wedges[mu_idx + 1]
+        dmu = mu2 - mu1
+        for ell_idx, ell in enumerate(ells):
+            if ell == 0:
+                window = 1.0
+            else:
+                Lp = Leg(ell + 1)
+                Lm = Leg(ell - 1)
+                integral = (Lp(mu2) - Lm(mu2) - Lp(mu1) + Lm(mu1)) / (2 * ell + 1)
+                window = (2 * ell + 1) * integral / dmu
+            W[mu_idx, ell_idx] = window
+
+    # Compute W^{-1} (or use least-squares if not square)
+    if nmu == nell:
+        W_inv = np.linalg.inv(W)
+    else:
+        # Over/under-determined: use least-squares solution
+        W_inv = np.linalg.pinv(W)
+
+    # For each k, recover multipoles: P_poles = W^{-1} · P_wedges
+    for k_idx in range(nk):
+        plk_arr[k_idx, :] = W_inv @ pkmu[k_idx, :]
+
+    return plk_arr
+
+
 def _compute_power_spectra(
     spec: ExperimentSpec,
     catalog: PreparedCatalog,
@@ -1066,6 +1173,45 @@ def _compute_power_spectra(
     # For periodic boxes (Quijote), use Cartesian coordinates (xyz) so los='z' refers to the box z-axis.
     # For lightcones (Halfdome), use spherical coordinates (rdd) for proper angular treatment.
     position_type = 'xyz' if spec.mock_type == 'quijote' else 'rdd'
+
+    los = 'endpoint' if spec.mock_type == 'halfdome' else 'z'
+
+    # endpoint LOS: compute poles, then project to wedges
+    if spec.mock_type == 'halfdome':
+        result = CatalogFFTPower(
+            data_positions1=catalog.positions_rdd,
+            data_weights1=catalog.weights,
+            randoms_positions1=rand_positions,
+            randoms_weights1=rand_weights,
+            nmesh=spec.nmesh,
+            los=los,
+            position_type=position_type,
+            resampler='tsc',
+            dtype='f8',
+            ells=spec.ells,
+            edges=kedges,              # <-- k-only for poles
+            interlacing=2,
+            shotnoise=None,
+            mpiroot=0,
+        )
+        
+        plk = result.poles.get_power()
+        print('plk shape from CatalogFFTPower:', plk.shape)
+        print('plk is ', plk)
+        # plk = result.poles.power                      # shape usually (nell, nk)
+        kcen = result.poles.k                         # shape (nk,)
+        shot_noise = result.poles.shotnoise
+        
+        # Subtract shot noise from monopole (ell=0, first multipole in ells)
+        # plk = plk.copy()
+        # plk[0, :] -= shot_noise
+        
+        plk_kell = np.moveaxis(plk, 0, 1)            # -> (nk, nell)
+
+        print('plk kell has shape', plk_kell.shape)
+        print('should be same as kcen shape', kcen.shape)
+        pkmu = _poles_to_wedges(spec.ells, plk_kell, mu_wedges)  # (nk, nmu)
+        return kcen, pkmu, plk, shot_noise
     
     result = CatalogFFTPower(
         data_positions1=catalog.positions_rdd,
@@ -1086,8 +1232,13 @@ def _compute_power_spectra(
     pkmu = result.wedges.get_power()
     plk = result.poles.power
     kcen = result.wedges.k[:, 0]
+    shot_noise = result.poles.shotnoise
+    
+    # Subtract shot noise from monopole (ell=0, first multipole in ells)
+    plk = plk.copy()
+    plk[0, :] -= shot_noise
 
-    return kcen, pkmu, plk
+    return kcen, pkmu, plk, shot_noise
 
 
 def _downsample_to_nbar(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
@@ -1212,17 +1363,25 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
         print('  y: [{:.2f}, {:.2f}]'.format(catalog.positions_rdd[1].min(), catalog.positions_rdd[1].max()))
         print('  z: [{:.2f}, {:.2f}]'.format(catalog.positions_rdd[2].min(), catalog.positions_rdd[2].max()))
         print('Catalog weights range after contamination: [{:.3e}, {:.3e}]'.format(catalog.weights.min(), catalog.weights.max()))
-        kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
+        kcen, pkmu, plk, shot_noise = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
 
     else:
-        kcen, pkmu, plk = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
+        kcen, pkmu, plk, shot_noise = _compute_power_spectra(spec, catalog, rand_positions, rand_weights)
+
+    # Compute P_ℓ(k) with lowest μ bin nulled for diagnostics
+    mu_wedges = build_mu_wedges(spec)
+    pkmu_null = pkmu.copy()
+    pkmu_null[:, 0] = 0.0  # Null the lowest μ bin
+    plk_null = _wedges_to_poles(spec.ells, pkmu_null, mu_wedges)
 
     return ExperimentResult(
         spec=spec,
         kcen=kcen,
         all_pkmu=pkmu[None, ...],
         all_plk=plk[None, ...],
-        mu_wedges=build_mu_wedges(spec),
+        mu_wedges=mu_wedges,
+        shot_noise=shot_noise,
+        all_plk_null_lowest_mu=plk_null.T[None, ...],
         run_metadata={
             'mock_idx': mock_idx,
             'n_data': int(catalog.positions_rdd.shape[1]),
@@ -1242,6 +1401,7 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
     nwedge = len(mu_wedges) - 1
     all_pkmu = np.zeros((nmock, nkbin, nwedge), dtype=complex)
     all_plk = np.zeros((nmock, len(spec.ells), nkbin), dtype=complex)
+    all_plk_null_lowest_mu = np.zeros((nmock, len(spec.ells), nkbin), dtype=complex)
     kcen = None
     run_records: list[dict[str, Any]] = []
 
@@ -1250,6 +1410,8 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
         result = run_single_experiment(spec, mock_idx=mock_idx, dm=dm)
         all_pkmu[mock_idx] = result.all_pkmu[0]
         all_plk[mock_idx] = result.all_plk[0]
+        if result.all_plk_null_lowest_mu is not None:
+            all_plk_null_lowest_mu[mock_idx] = result.all_plk_null_lowest_mu[0]
         if kcen is None:
             kcen = result.kcen
         run_records.append(result.run_metadata)
@@ -1263,6 +1425,8 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
         all_pkmu=all_pkmu,
         all_plk=all_plk,
         mu_wedges=mu_wedges,
+        all_plk_null_lowest_mu=all_plk_null_lowest_mu,
+        shot_noise=result.shot_noise,
         run_metadata={
             'records': run_records,
             'nmock': nmock,
@@ -1458,17 +1622,21 @@ def save_experiment_result(result: ExperimentResult) -> str:
     os.makedirs(result.spec.save_dir, exist_ok=True)
     label = result.spec.output_name or build_run_label(result.spec)
     output_path = os.path.join(result.spec.save_dir, f'{label}.npz')
-    np.savez(
-        output_path,
-        kcen=result.kcen,
-        all_pkmu=result.all_pkmu,
-        all_plk=result.all_plk,
-        ells=np.asarray(result.spec.ells),
-        mu_wedges=result.mu_wedges,
-        run_config_json=json.dumps(_spec_to_jsonable(result.spec), sort_keys=True),
-        run_metadata_json=json.dumps(result.run_metadata, default=str, sort_keys=True),
-        run_label=label,
-    )
+    save_dict = {
+        'kcen': result.kcen,
+        'all_pkmu': result.all_pkmu,
+        'all_plk': result.all_plk,
+        'ells': np.asarray(result.spec.ells),
+        'mu_wedges': result.mu_wedges,
+        'shot_noise': result.shot_noise,
+        'run_config_json': json.dumps(_spec_to_jsonable(result.spec), sort_keys=True),
+        'run_metadata_json': json.dumps(result.run_metadata, default=str, sort_keys=True),
+        'run_label': label,
+    }
+    # Include nulled multipoles if available
+    if result.all_plk_null_lowest_mu is not None:
+        save_dict['all_plk_null_lowest_mu'] = result.all_plk_null_lowest_mu
+    np.savez(output_path, **save_dict)
     append_run_ledger(
         result.spec.save_dir,
         {

@@ -70,8 +70,24 @@ $RUN --run-name halfdome_powlaw $HALFDOME_COMMON \
 
 $PYBIN run_transverse_sys_test.py \
       --mock-type halfdome --n-sample 20000000 --target-nbar 1e-4 \
-        --nmesh 128 --delta-k 0.005 --k-max 0.15 --nmock 3 \
+        --nmesh 128 --delta-k 0.005 --k-max 0.15 --nmock 1 \
           --run-name power_law_halfdome   --spec-type power_law   --sys-amp 0.1   --nmock 1
+
+
+OMP_NUM_THREADS=8 $PYBIN run_transverse_sys_test.py  \
+     --mock-type halfdome --n-sample 20000000 --target-nbar 1e-4   \
+           --nmesh 256 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1 \
+             --spec-type power_law   --sys-amp 0.02   --nmock 5 --plot-yscale log --plot-ylim-min 0.1 \
+              --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 10000 --plot-yscale-ps log
+
+
+
+OMP_NUM_THREADS=8 $PYBIN run_transverse_sys_test.py  \
+     --mock-type halfdome --n-sample 40000000 --target-nbar 3e-4   \
+           --z-min 0.1 --z-max 0.4 --nmesh 128 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1_lowz_snsub \
+             --spec-type power_law   --sys-amp 0.02   --nmock 2 --plot-yscale log --plot-ylim-min 0.1 \
+              --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 10000 --plot-yscale-ps log
+
 
 
 
