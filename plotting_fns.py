@@ -5,6 +5,64 @@ from mpl_toolkits.mplot3d import Axes3D # For 3D visualization (optional)
 from matplotlib.cm import get_cmap
 from astropy.cosmology import Planck18 as cosmo
 
+
+
+def plot_halfdome_celestial_diagnostics(fig_dir: str) -> None:
+    """
+    Generate celestial coordinate (RA/DEC/r) diagnostics for halfdome catalog.
+    
+    Loads and visualizes the RA/DEC/r coordinates (position_type='rdd') that are 
+    actually used in power spectrum calculations, showing:
+    - RA/DEC distributions on the celestial sphere
+    - Radial distance distribution
+    - Correlations between coordinates
+    - Sky coverage pattern
+    """
+    if MOCK_TYPE != 'halfdome':
+        return  # Only for halfdome
+    
+    os.makedirs(fig_dir, exist_ok=True)
+    
+    print('\n[Celestial diagnostics] Generating RA/DEC/r visualizations...')
+    
+    try:
+        dm = desi_mock()
+        dm.halfdome_mock_basedir = DEFAULT_HALFDOME_BASEDIR
+        
+        # ── Load clean halfdome catalog for mock 0 ────────────────────────────
+        mock_idx = 0
+        galpos_clean, redshift_clean = dm.load_halfdome_mock(mock_idx, n_sample=N_SAMPLE, seed=42)
+        
+        # Use nominal boxsize initially to compute RA/DEC/r
+        nominal_boxsize = 1000.0
+        ra_clean, dec_clean, r_clean = convert_to_ra_dec_distance(galpos_clean, nominal_boxsize, center_offset_mpc=0.0)
+        r_clean_values = np.asarray(r_clean.value if hasattr(r_clean, 'value') else r_clean)
+        
+        # Use maximum r value as the effective boxsize for reference
+        max_r = np.max(r_clean_values)
+        print(f'  Clean catalog: {len(ra_clean):,} objects, max distance: {max_r:.1f} Mpc/h')
+        
+        # ── Generate diagnostic plots ─────────────────────────────────────────
+        plot_radec_distribution(ra_clean, dec_clean, fig_dir, '_halfdome_clean', 
+                               title_suffix='(halfdome clean catalog)')
+        print(f'    Saved RA/DEC distribution')
+        
+        plot_comoving_distance_distribution(r_clean_values, fig_dir, '_halfdome_clean',
+                                           title_suffix='(halfdome clean catalog)')
+        print(f'    Saved distance distribution')
+        
+        plot_radec_distance_correlation(ra_clean, dec_clean, r_clean_values, fig_dir, 
+                                        '_halfdome_clean', title_suffix='(halfdome clean catalog)')
+        print(f'    Saved RA/DEC/r correlation plot')
+        
+        print('  ✓ Celestial coordinate diagnostics complete')
+        
+    except Exception as e:
+        print(f'  ✗ Error generating celestial diagnostics: {e}')
+        import traceback
+        traceback.print_exc()
+
+
 def plot_hexbin_density(xpos, ypos, gridsize=200, cmap='plasma', mincnt=1, figsize=(7, 4), \
                        xlabel='RA', ylabel='DEC', return_fig=False):
 
