@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 import json
 import os
 from itertools import product
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import healpy as hp
@@ -40,13 +38,13 @@ DEFAULT_HALFDOME_BASEDIR = '/global/cfs/cdirs/cmb/gsharing/halfdome/full_res/hal
 # Contamination map cache: stores computed sys_maps by (spec_label, mock_idx)
 # to avoid recomputing the same field for each mode (additive, multiplicative).
 # ─────────────────────────────────────────────────────────────────────────────
-_contamination_map_cache: dict[tuple[str, int], np.ndarray] = {}
+_contamination_map_cache: Dict[Tuple[str, int], np.ndarray] = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gaia HEALPix mask cache: stores the extragalactic Gaia coverage mask by mock_idx.
 # The mask is a HEALPix array where True = coverage (counts > 0), False = no coverage.
 # ─────────────────────────────────────────────────────────────────────────────
-_gaia_healpix_mask_cache: dict[int, np.ndarray] = {}
+_gaia_healpix_mask_cache: Dict[int, np.ndarray] = {}
 
 
 @dataclass(frozen=True)
@@ -72,16 +70,16 @@ class ExperimentSpec:
     mu_min: float = 0.0
     mu_max: float = 1.0
     nwedge: int = 6
-    mu_wedges: tuple[float, ...] | None = None
+    mu_wedges: Optional[Tuple[float, ...]] = None
     mu_binning_strategy: str = 'nonuniform'
     n_clean_bins: int = 8
-    ells: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    ells: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
     nmesh: int = 512
     boxsize: float = 1000.0
     n_random_factor: int = 5
     seed: int = 42
     save_dir: str = 'data/plk'
-    output_name: str | None = None
+    output_name: Optional[str] = None
     plot: bool = False
     nplot: int = 0
     quijote_basedir: str = DEFAULT_QUIJOTE_BASEDIR
@@ -93,13 +91,13 @@ class ExperimentSpec:
     los: str = 'z'
     # Target comoving number density for downsampling (h/Mpc)^3.
     # If None, no nbar-based downsampling is applied (use n_sample instead).
-    target_nbar: float | None = None
+    target_nbar: Optional[float] = None
     # Controlled transverse systematic parameters
     sys_amp: float = 0.01
     sys_spec_type: str = 'power_law'
     sys_ell_min: int = 6
     sys_ell_max: int = 64
-    sys_ell_delta: int | None = None
+    sys_ell_delta: Optional[int] = None
     # For gaia_stellar spec_type: 'rms'=scale to RMS amplitude (default),
     # 'mean'=scale to mean value (contamination fraction)
     sys_amp_mode: str = 'rms'
@@ -130,10 +128,10 @@ class ExperimentSpec:
 class PreparedCatalog:
     positions_rdd: np.ndarray
     weights: np.ndarray
-    base_redshifts: np.ndarray | None
+    base_redshifts: Optional[np.ndarray]
     base_r: np.ndarray
     mock_idx: int
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -144,18 +142,18 @@ class ExperimentResult:
     all_plk: np.ndarray
     mu_wedges: np.ndarray
     shot_noise: float
-    output_path: str | None = None
-    label: str | None = None
-    run_metadata: dict[str, Any] = field(default_factory=dict)
-    all_plk_null_lowest_mu: np.ndarray | None = None  # P_ℓ(k) with lowest μ bin nulled
+    output_path: Optional[str] = None
+    label: Optional[str] = None
+    run_metadata: Dict[str, Any] = field(default_factory=dict)
+    all_plk_null_lowest_mu: Optional[np.ndarray] = None  # P_ℓ(k) with lowest μ bin nulled
 
 
-def _slug_number(value: float | int) -> str:
+def _slug_number(value: Union[float, int]) -> str:
     text = f'{value:g}'
     return text.replace('-', 'm').replace('.', 'p')
 
 
-def _spec_to_jsonable(spec: ExperimentSpec) -> dict[str, Any]:
+def _spec_to_jsonable(spec: ExperimentSpec) -> Dict[str, Any]:
     data = asdict(spec)
     if data['mu_wedges'] is not None:
         data['mu_wedges'] = list(data['mu_wedges'])
@@ -167,10 +165,53 @@ def build_kedges(spec: ExperimentSpec) -> np.ndarray:
 
 
 def build_mu_wedges(spec: ExperimentSpec) -> np.ndarray:
+    """Build mu bin edges for power spectrum.
+    
+    Supports: 'uniform', 'nonuniform', 'delta_function', or manual mu_wedges.
+    """
     if spec.mu_wedges is not None:
         return np.asarray(spec.mu_wedges, dtype=float)
 
     strategy = spec.mu_binning_strategy.lower()
+    
+    if strategy == 'delta_function':
+        # Delta-function systematic binning: use analytical formula
+        from nonunif_binning import compute_mu_edges_for_delta_function
+        
+        # Extract required parameters
+        if not hasattr(spec, 'sys_spec_type') or spec.sys_spec_type != 'delta':
+            raise ValueError(
+                'delta_function strategy requires sys_spec_type="delta"'
+            )
+        if not hasattr(spec, 'sys_ell_delta'):
+            raise ValueError('delta_function strategy requires sys_ell_delta attribute')
+        if not hasattr(spec, 'zmin') or not hasattr(spec, 'zmax'):
+            raise ValueError('delta_function strategy requires zmin and zmax')
+        
+        z_eff = (spec.zmin + spec.zmax) / 2.0
+        ell_contam = spec.sys_ell_delta
+        R_window = getattr(spec, 'sys_window_r', 780.0)
+        ell_max = max(spec.ells)
+        ell_kernel_max = getattr(spec, 'sys_ell_kernel_max', 128)
+        n_clean_bins = spec.n_clean_bins
+        A = getattr(spec, 'sys_kernel_amp', 1e-5)
+        mu1_min = getattr(spec, 'sys_mu1_min', 0.02)
+        mu1_max = getattr(spec, 'sys_mu1_max', 0.3)
+        verbose = getattr(spec, 'verbose', False)
+        
+        return compute_mu_edges_for_delta_function(
+            ell_contam=ell_contam,
+            z_eff=z_eff,
+            ell_max=ell_max,
+            ell_kernel_max=ell_kernel_max,
+            R_window=R_window,
+            A=A,
+            n_clean_bins=n_clean_bins,
+            mu1_min=mu1_min,
+            mu1_max=mu1_max,
+            verbose=verbose,
+        )
+    
     if strategy == 'nonuniform':
         ell_max = max(spec.ells)
         return np.asarray(
@@ -223,7 +264,7 @@ def build_run_label(spec: ExperimentSpec) -> str:
     return '_'.join(parts)
 
 
-def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
+def recommended_base_kwargs(mock_type: str = 'halfdome') -> Dict[str, Any]:
     """Return recommended base kwargs for the current pipeline defaults."""
     mock_type_norm = mock_type.lower()
     if mock_type_norm not in {'halfdome', 'quijote'}:
@@ -262,7 +303,7 @@ def recommended_base_kwargs(mock_type: str = 'halfdome') -> dict[str, Any]:
     }
 
 
-def append_run_ledger(save_dir: str, entry: dict[str, Any]) -> str:
+def append_run_ledger(save_dir: str, entry: Dict[str, Any]) -> str:
     ledger_path = os.path.join(save_dir, 'run_ledger.jsonl')
     os.makedirs(save_dir, exist_ok=True)
     with open(ledger_path, 'a', encoding='utf-8') as handle:
@@ -270,7 +311,7 @@ def append_run_ledger(save_dir: str, entry: dict[str, Any]) -> str:
     return ledger_path
 
 
-def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> dict[str, int]:
+def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> Dict[str, int]:
     """Return per-stage deterministic seeds derived from spec.seed and mock_idx.
 
     Each pipeline stage draws from its own independent RNG stream so that
@@ -411,7 +452,7 @@ def _apply_gal_lat_cut(catalog: PreparedCatalog, cut_deg: float) -> PreparedCata
     return catalog
 
 
-def _apply_healpix_mask_to_catalog(catalog: PreparedCatalog, mask: np.ndarray, nside: int | None = None) -> PreparedCatalog:
+def _apply_healpix_mask_to_catalog(catalog: PreparedCatalog, mask: np.ndarray, nside: Optional[int] = None) -> PreparedCatalog:
     """Apply a HEALPix binary mask to the catalog. Removes catalog entries in masked (False) pixels.
     
     Parameters
@@ -814,7 +855,7 @@ def _generate_uniform_randoms_in_healpix_mask(
     chi_interp,
     z_source: np.ndarray,
     seed: int = 42
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate random RA/Dec positions uniformly within a HEALPix mask region.
     
@@ -884,7 +925,7 @@ def _generate_uniform_randoms_in_healpix_mask(
     return ra_rand, dec_rand, r_rand
 
 
-def _build_random_catalog_periodic(spec: ExperimentSpec, catalog: PreparedCatalog) -> tuple[np.ndarray, np.ndarray]:
+def _build_random_catalog_periodic(spec: ExperimentSpec, catalog: PreparedCatalog) -> Tuple[np.ndarray, np.ndarray]:
     seeds = _stage_seeds(spec, catalog.mock_idx)
     n_randoms = int(spec.n_random_factor * catalog.positions_rdd.shape[1])
     boxsize_use = catalog.metadata['boxsize_use']
@@ -898,7 +939,7 @@ def _build_random_catalog_periodic(spec: ExperimentSpec, catalog: PreparedCatalo
 
     return rand_positions, rand_weights
 
-def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> tuple[np.ndarray, np.ndarray]:
+def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> Tuple[np.ndarray, np.ndarray]:
     seeds = _stage_seeds(spec, catalog.mock_idx)
     n_randoms = int(spec.n_random_factor * catalog.positions_rdd.shape[1])
     boxsize_use = catalog.metadata['boxsize_use']
@@ -1016,7 +1057,7 @@ def _maybe_apply_sys_to_randoms(
     catalog: PreparedCatalog,
     rand_positions: np.ndarray,
     rand_weights: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """Phase C9: optionally apply the multiplicative w_sys to randoms.
 
     If the all-mu leakage in P(k,mu) is an estimator-level effect (e.g.
@@ -1141,104 +1182,230 @@ def _wedges_to_poles(ells, pkmu: np.ndarray, mu_wedges: np.ndarray) -> np.ndarra
     return plk_arr
 
 
+def _compute_raw_multipoles(
+    spec: ExperimentSpec,
+    catalog: PreparedCatalog,
+    rand_positions: np.ndarray,
+    rand_weights: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Compute power spectrum multipoles P_ell(k) without computing wedges.
+
+    This is the "raw" FFT computation that is independent of mu binning.
+    The result can be cached and reused to reconstruct different mu binning schemes.
+
+    Parameters
+    ----------
+    spec : ExperimentSpec
+        Experiment specification
+    catalog : PreparedCatalog
+        Prepared galaxy catalog (positions, weights, etc.)
+    rand_positions : np.ndarray
+        Random catalog positions
+    rand_weights : np.ndarray
+        Random catalog weights
+
+    Returns
+    -------
+    kcen : np.ndarray
+        k bin centers, shape (nk,)
+    all_plk : np.ndarray
+        Power spectrum multipoles, shape (nk, nell)
+    shot_noise : float
+        Estimated shot noise
+
+    Raises
+    ------
+    ValueError
+        If FFT computation fails
+    """
+    from pypower import CatalogFFTPower
+
+    try:
+        kedges = build_kedges(spec)
+        if not np.all(np.diff(kedges) > 0):
+            raise ValueError("k edges must be strictly increasing")
+
+        # Use uniform dummy mu binning for multipole computation
+        # (poles don't depend on mu binning; we just need edges for the FFT)
+        dummy_mu_wedges = np.linspace(0.0, 1.0, 2)
+
+        position_type = 'xyz' if spec.mock_type == 'quijote' else 'rdd'
+        los = 'firstpoint' if spec.mock_type == 'halfdome' else 'z'
+
+        # For halfdome, compute poles only; for quijote, poles are automatic
+        if spec.mock_type == 'halfdome':
+            result = CatalogFFTPower(
+                data_positions1=catalog.positions_rdd,
+                data_weights1=catalog.weights,
+                randoms_positions1=rand_positions,
+                randoms_weights1=rand_weights,
+                nmesh=spec.nmesh,
+                los=los,
+                position_type=position_type,
+                resampler='tsc',
+                dtype='f8',
+                ells=spec.ells,
+                edges=kedges,
+                interlacing=3,
+                shotnoise=None,
+                mpiroot=0,
+            )
+            plk = result.poles.get_power()
+            kcen = result.poles.k
+            shot_noise = result.poles.shotnoise
+        else:
+            result = CatalogFFTPower(
+                data_positions1=catalog.positions_rdd,
+                data_weights1=catalog.weights,
+                randoms_positions1=rand_positions,
+                randoms_weights1=rand_weights,
+                nmesh=spec.nmesh,
+                los=los,
+                position_type=position_type,
+                resampler='tsc',
+                dtype='f8',
+                ells=spec.ells,
+                edges=(kedges, dummy_mu_wedges),
+                interlacing=3,
+                shotnoise=None,
+                mpiroot=0,
+            )
+            plk = result.poles.power
+            kcen = result.wedges.k[:, 0]
+            shot_noise = result.poles.shotnoise
+
+        # Transpose to (nk, nell) format
+        plk_kell = np.moveaxis(plk, 0, 1)
+        if plk_kell.shape[1] != len(spec.ells):
+            raise ValueError(
+                f"Pole array mismatch: expected (nk, {len(spec.ells)}), got {plk_kell.shape}"
+            )
+
+        return kcen, plk_kell, shot_noise
+
+    except Exception as e:
+        raise ValueError(f"Failed to compute raw multipoles: {e}")
+
+
+def _reconstruct_pkmu_from_poles(
+    all_plk: np.ndarray,
+    ells: tuple,
+    mu_wedges: np.ndarray,
+) -> np.ndarray:
+    """
+    Reconstruct P(k, mu) wedges from power spectrum multipoles P_ell(k).
+
+    Fast afterburner to convert cached P_ell(k) to P(k, mu) for any mu binning.
+    Uses inverse Legendre polynomial transformation.
+
+    Parameters
+    ----------
+    all_plk : np.ndarray
+        Power spectrum multipoles, shape (nk, nell)
+    ells : tuple
+        Multipole orders, length nell
+    mu_wedges : np.ndarray
+        Mu bin edges for wedge reconstruction
+
+    Returns
+    -------
+    pkmu : np.ndarray
+        P(k, mu) in wedges, shape (nk, nmu)
+
+    Raises
+    ------
+    ValueError
+        If reconstruction fails
+    """
+    try:
+        if all_plk.ndim != 2:
+            raise ValueError(f"all_plk must be 2D (nk, nell), got shape {all_plk.shape}")
+        nk, nell = all_plk.shape
+        if nell != len(ells):
+            raise ValueError(
+                f"all_plk has {nell} ell columns but expected {len(ells)} (ells={ells})"
+            )
+        if len(mu_wedges) < 2:
+            raise ValueError(f"mu_wedges must have at least 2 edges, got {len(mu_wedges)}")
+
+        pkmu = _poles_to_wedges(ells, all_plk, mu_wedges)
+        if pkmu.shape != (nk, len(mu_wedges) - 1):
+            raise ValueError(
+                f"pkmu reconstruction failed: expected shape (nk={nk}, nmu={len(mu_wedges)-1}), got {pkmu.shape}"
+            )
+        return pkmu
+
+    except Exception as e:
+        raise ValueError(f"Failed to reconstruct P(k,mu) from poles: {e}")
+
+
 def _compute_power_spectra(
     spec: ExperimentSpec,
     catalog: PreparedCatalog,
     rand_positions: np.ndarray,
     rand_weights: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    Compute power spectrum P(k, mu) using pypower's CatalogFFTPower.
-    
-    Parameters for CatalogFFTPower:
-    - interlacing=2: FFT interlacing for alias reduction (standard practice)
-    - shotnoise=None: Explicit shot noise handling (auto-estimated if None)
-    - mpiroot=0: MPI compatibility (single-node safe; ignored if not using MPI)
-    
-    For multi-threading: Set OMP_NUM_THREADS environment variable before running.
-    Example: OMP_NUM_THREADS=16 python script.py
+    Orchestrate power spectrum computation with caching.
+
+    Workflow:
+    1. Compute P_ell(k) multipoles (independent of mu binning)
+    2. Build mu wedges for target binning strategy
+    3. Reconstruct P(k, mu) from cached P_ell(k)
+
+    Returns 4 values: (kcen, pkmu, all_plk, shot_noise)
+
+    Parameters
+    ----------
+    spec : ExperimentSpec
+        Experiment specification
+    catalog : PreparedCatalog
+        Prepared galaxy catalog
+    rand_positions : np.ndarray
+        Random catalog positions
+    rand_weights : np.ndarray
+        Random catalog weights
+
+    Returns
+    -------
+    kcen : np.ndarray
+        k bin centers
+    pkmu : np.ndarray
+        P(k, mu) in wedges
+    all_plk : np.ndarray
+        P_ell(k) multipoles (cached for reuse)
+    shot_noise : float
+        Estimated shot noise
     """
-    from pypower import CatalogFFTPower
-
-    kedges = build_kedges(spec)
-
-    print('kedges in build spec is ', kedges)
-    mu_wedges = build_mu_wedges(spec)
-
-    # Compute wedges and poles simultaneously using los='z' (global plane-parallel),
-    # matching compute_pkmu_mocks exactly. Direct wedge estimation bins the 3D FFT
-    # grid by (|k|, k_z/|k|) and is exact — unlike reconstructing wedges from a
-    # truncated multipole set which loses power in ells beyond the max computed.
-    
-    # For periodic boxes (Quijote), use Cartesian coordinates (xyz) so los='z' refers to the box z-axis.
-    # For lightcones (Halfdome), use spherical coordinates (rdd) for proper angular treatment.
-    position_type = 'xyz' if spec.mock_type == 'quijote' else 'rdd'
-
-    los = 'endpoint' if spec.mock_type == 'halfdome' else 'z'
-
-    # endpoint LOS: compute poles, then project to wedges
-    if spec.mock_type == 'halfdome':
-        result = CatalogFFTPower(
-            data_positions1=catalog.positions_rdd,
-            data_weights1=catalog.weights,
-            randoms_positions1=rand_positions,
-            randoms_weights1=rand_weights,
-            nmesh=spec.nmesh,
-            los=los,
-            position_type=position_type,
-            resampler='tsc',
-            dtype='f8',
-            ells=spec.ells,
-            edges=kedges,              # <-- k-only for poles
-            interlacing=2,
-            shotnoise=None,
-            mpiroot=0,
+    try:
+        # 1) Compute raw multipoles P_ell(k)
+        kcen, all_plk, shot_noise = _compute_raw_multipoles(
+            spec, catalog, rand_positions, rand_weights
         )
-        
-        plk = result.poles.get_power()
-        print('plk shape from CatalogFFTPower:', plk.shape)
-        print('plk is ', plk)
-        # plk = result.poles.power                      # shape usually (nell, nk)
-        kcen = result.poles.k                         # shape (nk,)
-        shot_noise = result.poles.shotnoise
-        
-        # Subtract shot noise from monopole (ell=0, first multipole in ells)
-        # plk = plk.copy()
-        # plk[0, :] -= shot_noise
-        
-        plk_kell = np.moveaxis(plk, 0, 1)            # -> (nk, nell)
 
-        print('plk kell has shape', plk_kell.shape)
-        print('should be same as kcen shape', kcen.shape)
-        pkmu = _poles_to_wedges(spec.ells, plk_kell, mu_wedges)  # (nk, nmu)
-        return kcen, pkmu, plk, shot_noise
-    
-    result = CatalogFFTPower(
-        data_positions1=catalog.positions_rdd,
-        data_weights1=catalog.weights,
-        randoms_positions1=rand_positions,
-        randoms_weights1=rand_weights,
-        nmesh=spec.nmesh,
-        los=spec.los,
-        position_type=position_type,
-        resampler='tsc',
-        dtype='f8',
-        ells=spec.ells,
-        edges=(kedges, mu_wedges),
-        interlacing=2,
-        shotnoise=None,
-        mpiroot=0,
-    )
-    pkmu = result.wedges.get_power()
-    plk = result.poles.power
-    kcen = result.wedges.k[:, 0]
-    shot_noise = result.poles.shotnoise
-    
-    # Subtract shot noise from monopole (ell=0, first multipole in ells)
-    plk = plk.copy()
-    plk[0, :] -= shot_noise
+        if kcen.shape[0] != all_plk.shape[0]:
+            raise ValueError(
+                f"kcen and all_plk mismatch: {kcen.shape[0]} vs {all_plk.shape[0]}"
+            )
 
-    return kcen, pkmu, plk, shot_noise
+        # 2) Compute mu wedges for target binning strategy
+        mu_wedges = build_mu_wedges(spec)
+        if len(mu_wedges) < 2:
+            raise ValueError(f"mu_wedges must have at least 2 edges, got {len(mu_wedges)}")
+
+        # 3) Reconstruct P(k, mu) from cached P_ell(k)
+        pkmu = _reconstruct_pkmu_from_poles(all_plk, spec.ells, mu_wedges)
+
+        if pkmu.shape[0] != kcen.shape[0]:
+            raise ValueError(
+                f"pkmu and kcen mismatch: {pkmu.shape[0]} vs {kcen.shape[0]}"
+            )
+
+        return kcen, pkmu, all_plk, shot_noise
+
+    except Exception as e:
+        raise ValueError(f"Power spectrum computation failed: {e}")
 
 
 def _downsample_to_nbar(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
@@ -1285,7 +1452,7 @@ def _downsample_to_nbar(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx
     return catalog
 
 
-def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | None = None) -> ExperimentResult:
+def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: Optional[desi_mock] = None) -> ExperimentResult:
     if dm is None:
         dm = desi_mock()
 
@@ -1391,7 +1558,7 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: desi_mock | N
     )
 
 
-def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None = None) -> ExperimentResult:
+def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: Optional[desi_mock] = None) -> ExperimentResult:
     if dm is None:
         dm = desi_mock()
 
@@ -1403,7 +1570,7 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
     all_plk = np.zeros((nmock, len(spec.ells), nkbin), dtype=complex)
     all_plk_null_lowest_mu = np.zeros((nmock, len(spec.ells), nkbin), dtype=complex)
     kcen = None
-    run_records: list[dict[str, Any]] = []
+    run_records: List[Dict[str, Any]] = []
 
     for mock_idx in range(nmock):
         print(f'  [{mock_idx + 1}/{nmock}] Computing...')
@@ -1437,18 +1604,18 @@ def run_experiment_grid(spec: ExperimentSpec, nmock: int, dm: desi_mock | None =
 
 
 def run_variant_collection(
-    specs: list[ExperimentSpec],
+    specs: List[ExperimentSpec],
     nmock: int,
-    dm: desi_mock | None = None,
-) -> dict[str, ExperimentResult]:
-    results: dict[str, ExperimentResult] = {}
+    dm: Optional[desi_mock] = None,
+) -> Dict[str, ExperimentResult]:
+    results: Dict[str, ExperimentResult] = {}
     for spec in specs:
         result = run_experiment_grid(spec, nmock=nmock, dm=dm)
         results[build_run_label(spec)] = result
     return results
 
 
-def _normalize_options(values: Any, *, name: str) -> tuple[Any, ...]:
+def _normalize_options(values: Any, *, name: str) -> Tuple[Any, ...]:
     if values is None:
         return tuple()
     if isinstance(values, str):
@@ -1458,9 +1625,9 @@ def _normalize_options(values: Any, *, name: str) -> tuple[Any, ...]:
     return tuple(values)
 
 
-def _coerce_bool_options(values: Any, *, name: str) -> tuple[bool, ...]:
+def _coerce_bool_options(values: Any, *, name: str) -> Tuple[bool, ...]:
     normalized = _normalize_options(values, name=name)
-    coerced: list[bool] = []
+    coerced: List[bool] = []
     for value in normalized:
         if isinstance(value, bool):
             coerced.append(value)
@@ -1481,15 +1648,15 @@ def _coerce_bool_options(values: Any, *, name: str) -> tuple[bool, ...]:
 
 
 def build_quijote_variant_specs(
-    with_rsd_options: tuple[bool, ...] = (False, True),
-    contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
-    stellar_fracs: tuple[float, ...] = (0.01,),
-    sfd_stds: tuple[float, ...] = (0.01,),
+    with_rsd_options: Tuple[bool, ...] = (False, True),
+    contamination_modes: Tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
+    stellar_fracs: Tuple[float, ...] = (0.01,),
+    sfd_stds: Tuple[float, ...] = (0.01,),
     quijote_geometry: str = 'full_cube',
-    base_kwargs: dict[str, Any] | None = None,
-) -> list[ExperimentSpec]:
+    base_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[ExperimentSpec]:
     base_kwargs = dict(base_kwargs or {})
-    specs: list[ExperimentSpec] = []
+    specs: List[ExperimentSpec] = []
     with_rsd_options = _coerce_bool_options(with_rsd_options, name='with_rsd_options')
     contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
     stellar_fracs = _normalize_options(stellar_fracs, name='stellar_fracs')
@@ -1536,13 +1703,13 @@ def build_quijote_variant_specs(
 
 
 def build_halfdome_variant_specs(
-    contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
-    stellar_fracs: tuple[float, ...] = (0.01,),
-    sfd_stds: tuple[float, ...] = (0.01,),
-    base_kwargs: dict[str, Any] | None = None,
-) -> list[ExperimentSpec]:
+    contamination_modes: Tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
+    stellar_fracs: Tuple[float, ...] = (0.01,),
+    sfd_stds: Tuple[float, ...] = (0.01,),
+    base_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[ExperimentSpec]:
     base_kwargs = dict(base_kwargs or {})
-    specs: list[ExperimentSpec] = []
+    specs: List[ExperimentSpec] = []
     contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
     stellar_fracs = _normalize_options(stellar_fracs, name='stellar_fracs')
     sfd_stds = _normalize_options(sfd_stds, name='sfd_stds')
@@ -1581,13 +1748,13 @@ def build_halfdome_variant_specs(
 
 def build_mock_variant_specs(
     mock_type: str,
-    contamination_modes: tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
-    stellar_fracs: tuple[float, ...] = (0.01,),
-    sfd_stds: tuple[float, ...] = (0.01,),
-    with_rsd_options: tuple[bool, ...] = (False, True),
+    contamination_modes: Tuple[str, ...] = ('none', 'stellar', 'dust', 'both'),
+    stellar_fracs: Tuple[float, ...] = (0.01,),
+    sfd_stds: Tuple[float, ...] = (0.01,),
+    with_rsd_options: Tuple[bool, ...] = (False, True),
     quijote_geometry: str = 'full_cube',
-    base_kwargs: dict[str, Any] | None = None,
-) -> list[ExperimentSpec]:
+    base_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[ExperimentSpec]:
     """Build variant specs for either halfdome or quijote using one entry point."""
     mock_type_norm = mock_type.lower()
     contamination_modes = _normalize_options(contamination_modes, name='contamination_modes')
