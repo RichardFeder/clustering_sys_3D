@@ -24,19 +24,33 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # no display on login nodes
 from matplotlib import pyplot as plt
-from matplotlib.cm import get_cmap
+# In newer matplotlib, get_cmap is accessed via plt.get_cmap or matplotlib.colormaps
+try:
+    from matplotlib.cm import get_cmap
+except ImportError:
+    # Fallback for matplotlib >= 3.5
+    from matplotlib import colormaps as cm_colormaps
+    def get_cmap(name):
+        return cm_colormaps[name]
 
 # ── make sure the repo root is on the path ──────────────────────────────────
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
-from pypower import setup_logging
+# Conditional import: only needed if using pypower (default)
+# Will be imported lazily when needed
+# from pypower import setup_logging
 
 from pipeline import (
     ExperimentSpec,
     _poles_to_wedges,
     _wedges_to_poles,
+    _window_matrix_diagnostics,
+    _prepare_quijote_catalog,
+    _build_random_catalog_periodic,
+    build_kedges,
+    build_mu_wedges,
     build_run_label,
     run_experiment_grid,
     save_experiment_result,
@@ -70,14 +84,21 @@ NMESH         = 512
 K_MIN         = 0.006
 K_MAX         = 0.2
 DELTA_K       = 0.01
-Z_MIN         = 0.1        # Halfdome redshift range (lower bound)
-Z_MAX         = 0.4        # Halfdome redshift range (upper bound)
-# ELLS          = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+Z_MIN         = 0.4        # Halfdome redshift range (lower bound)
+Z_MAX         = 1.0        # Halfdome redshift range (upper bound)
+ELLS          = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+COMPUTE_WINDOW = False
+WINDOW_METHOD = 'fft'
+USE_RADIAL_WINDOW = True  # Halfdome: use window-corrected mu bins; defaults True but override-able
 
-ELLS          = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+SEED = 45
+
+# ELLS          = tuple(range(0, 17))
+
+# ELLS          = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
 # ELLS          = (0, 2, 4, 6, 8)
 
-N_CLEAN_BINS  = 8
+N_CLEAN_BINS  = 7
 NGRID_SYS     = 256
 NO_CACHE      = False
 CLEAR         = False
@@ -93,8 +114,15 @@ MODES_TO_RUN  = None   # None = run all CONTAMINATION_MODES; else list of mode n
 MEAN_CONSERVING_ADDITIVE = True   # Phase H1 fix: mean-conserving additive injection
 APPLY_SYS_TO_RANDOMS     = False  # Phase C9 control: apply w_sys to randoms too
 GAL_LAT_CUT_DEG          = 0.0   # Galactic latitude cut (degrees); 0 = no cut
+USE_JAX                  = False  # Use jax-power instead of pypower
 SYS_AMP_MODE             = 'rms'  # 'rms' (default) or 'mean'; for gaia_stellar, controls interpretation of sys_amp
 SYS_AMP_MULT_SCALE       = 1.0   # Scaling factor for multiplicative contamination effect (>1 = stronger)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cached mu_wedges computed once upfront and reused throughout plotting functions
+# ─────────────────────────────────────────────────────────────────────────────
+COMPUTED_MU_WEDGES = None  # Will be computed in main() after parse_args()
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONTAMINATION_MODES = ['none', 'transverse_additive', 'transverse_multiplicative']
@@ -115,6 +143,42 @@ MODE_LS = {
     'transverse_additive':       '--',
     'transverse_multiplicative': ':',
 }
+
+
+def get_mu_wedges() -> np.ndarray:
+    """
+    Get cached mu_wedges, computing them once if needed.
+    
+    Computes window-corrected or null-bin mu wedges based on configuration
+    (mock_type, use_radial_window, etc.) and caches the result for reuse
+    across all plotting functions.
+    
+    Returns
+    -------
+    np.ndarray
+        Mu wedge bin edges in [0, 1].
+    """
+    global COMPUTED_MU_WEDGES
+    if COMPUTED_MU_WEDGES is not None:
+        return COMPUTED_MU_WEDGES
+    
+    # Compute once using build_mu_wedges from pipeline
+    from pipeline import build_mu_wedges
+    
+    # Create a minimal spec just for mu binning computation
+    spec_for_wedges = ExperimentSpec(
+        mock_type=MOCK_TYPE,
+        zmin=Z_MIN,
+        zmax=Z_MAX,
+        ells=ELLS,
+        n_clean_bins=N_CLEAN_BINS,
+        k_min=K_MIN,
+        k_max=K_MAX,
+        delta_k=DELTA_K,
+        use_radial_window=USE_RADIAL_WINDOW,
+    )
+    COMPUTED_MU_WEDGES = build_mu_wedges(spec_for_wedges)
+    return COMPUTED_MU_WEDGES
 
 
 def get_adaptive_ylim_log(data_arrays, default_lower=0.6, default_upper=1e1):
@@ -176,7 +240,7 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
             ells=ELLS,
             n_clean_bins=N_CLEAN_BINS,
             mu_binning_strategy='nonuniform',
-            los='endpoint',
+            los='firstpoint',
             sys_amp=SYS_AMP,
             sys_spec_type=SYS_SPEC_TYPE,
             sys_ell_min=SYS_ELL_MIN if SYS_SPEC_TYPE != 'gaia_stellar' else 0,
@@ -187,7 +251,11 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
             mean_conserving_additive=MEAN_CONSERVING_ADDITIVE,
             apply_sys_to_randoms=APPLY_SYS_TO_RANDOMS,
             gal_lat_cut_deg=GAL_LAT_CUT_DEG,
+            use_jax=USE_JAX,
+            use_radial_window=USE_RADIAL_WINDOW,
             save_dir=SAVE_DIR,
+            compute_window=COMPUTE_WINDOW,
+            window_method='fft'   # or 'smooth'
         )
     # Quijote periodic box
     return ExperimentSpec(
@@ -210,6 +278,8 @@ def build_spec(contamination_mode: str) -> ExperimentSpec:
         sys_amp_mult_scale=SYS_AMP_MULT_SCALE,
         mean_conserving_additive=MEAN_CONSERVING_ADDITIVE,
         apply_sys_to_randoms=APPLY_SYS_TO_RANDOMS,
+        use_jax=USE_JAX,
+        use_radial_window=False,  # Quijote periodic box: no radial window
         save_dir=SAVE_DIR,
     )
 
@@ -289,13 +359,15 @@ def plot_pkmu_comparison(results: dict[str, dict], fig_dir: str) -> None:
                             linewidth=2 if mu_idx == 0 else 1.2)
         ax.set_xlabel('k [h/Mpc]', fontsize=11)
         ax.grid(alpha=0.2)
+        ax.set_xscale('log')
 
         # Compute y-limits
-        if PLOT_YLIM_PS_MIN is not None and PLOT_YLIM_PS_MAX is not None:
-            ylim = (PLOT_YLIM_PS_MIN, PLOT_YLIM_PS_MAX)
-        if PLOT_YSCALE_PS == 'log':
-            ax.set_yscale('log')
-
+        # if PLOT_YLIM_PS_MIN is not None and PLOT_YLIM_PS_MAX is not None:
+            # ylim = (PLOT_YLIM_PS_MIN, PLOT_YLIM_PS_MAX)
+        # if PLOT_YSCALE_PS == 'log':
+        #     ax.set_yscale('log')
+        ax.set_ylim(0, 2000)
+        ax.set_xlim(1e-2, 0.3)
     axes[0].set_ylabel(r'$k\,P(k,\mu)$ [$({\rm Mpc}/h)^2$]', fontsize=11)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.2),
@@ -462,24 +534,25 @@ def plot_power_spectrum_multipoles(results: dict[str, dict], fig_dir: str) -> No
     #               4: r'$P_4(k)$ (hexadecapole)'}
     # ell_colors = {0: 'C0', 2: 'C1', 4: 'C2'}
 
-    # target_ells = [0, 2, 4, 6, 8, 10, 12, 14, 16]
+    target_ells = [0, 2, 4, 6, 8, 10, 12, 14, 16]
 
-    # ell_labels = {0: r'$P_0(k)$ (monopole)', 
-    #               2: r'$P_2(k)$ (quadrupole)', 
-    #               4: r'$P_4(k)$ (hexadecapole)', 
-    #               6: r'$P_6(k)$', 
-    #               8: r'$P_8(k)$',
-    #               10: r'$P_{10}(k)$',
-    #               12: r'$P_{12}(k)$',
-    #               14: r'$P_{14}(k)$',
-    #               16: r'$P_{16}(k)$'}
-    # ell_colors = {0: 'C0', 2: 'C1', 4: 'C2', 6: 'C3', 8: 'C4', 10: 'C5', 12: 'C6', 14: 'C7', 16: 'C8'}
+    ell_labels = {0: r'$P_0(k)$ (monopole)', 
+                  2: r'$P_2(k)$ (quadrupole)', 
+                  4: r'$P_4(k)$ (hexadecapole)', 
+                  6: r'$P_6(k)$', 
+                  8: r'$P_8(k)$',
+                  10: r'$P_{10}(k)$',
+                  12: r'$P_{12}(k)$',
+                  14: r'$P_{14}(k)$',
+                  16: r'$P_{16}(k)$'}
+    ell_colors = {0: 'C0', 2: 'C1', 4: 'C2', 6: 'C3', 8: 'C4', 10: 'C5', 12: 'C6', 14: 'C7', 16: 'C8'}
     
-    target_ells = [1, 3, 5, 7, 9, 11, 13, 15]
+    # target_ells = [1, 3, 5, 7, 9, 11, 13, 15]
+    target_ells = [0, 2, 4, 6, 8, 10, 12, 14, 16]
 
-    ell_labels = {1: r'$P_1(k)$', 3: r'$P_3(k)$', 5: r'$P_5(k)$', 7: r'$P_7(k)$',
-                  9: r'$P_9(k)$', 11: r'$P_{11}(k)$', 13: r'$P_{13}(k)$', 15: r'$P_{15}(k)$'}
-    ell_colors = {1: 'C0', 3: 'C1', 5: 'C2', 7: 'C3', 9: 'C4', 11: 'C5', 13: 'C6', 15: 'C7'}
+    # ell_labels = {1: r'$P_1(k)$', 3: r'$P_3(k)$', 5: r'$P_5(k)$', 7: r'$P_7(k)$',
+                  # 9: r'$P_9(k)$', 11: r'$P_{11}(k)$', 13: r'$P_{13}(k)$', 15: r'$P_{15}(k)$'}
+    # ell_colors = {1: 'C0', 3: 'C1', 5: 'C2', 7: 'C3', 9: 'C4', 11: 'C5', 13: 'C6', 15: 'C7'}
 
     # Build figure with one panel per contamination mode
     fig, axes = plt.subplots(1, len(CONTAMINATION_MODES), figsize=(4 * len(CONTAMINATION_MODES), 4.5),
@@ -609,9 +682,13 @@ def _load_sys_map_healpix(seed: int | None = None) -> np.ndarray:
         # Ensure masked regions stay at zero
         sys_map[mask_pixels] = 0.0
         return sys_map
-    
+
+    if SEED is not None:
+        seed = SEED
     if seed is None:
         seed = 42 + 0 * 10_000 + 2  # mock_idx=0, same as pipeline seed_dust
+
+    print('seed before gen_controlled_transverse_map is ', seed)
     return gen_controlled_transverse_map(
         amp=SYS_AMP,
         seed=seed,
@@ -998,7 +1075,13 @@ def plot_sys_map(fig_dir: str) -> None:
     # Use the same seed as the pipeline for mock 0
     # _stage_seeds: base = spec.seed + mock_idx * 10_000; seed = base + 2
     # ExperimentSpec default seed is 42
-    seed_dust = 42 + mock_idx * 10_000 + 2
+
+    seed_dust = None
+    if SEED is not None:
+        seed_dust = SEED
+
+    if seed_dust is None:
+        seed_dust = 42 + mock_idx * 10_000 + 2
 
     sys_map = gen_controlled_transverse_map(
         amp=SYS_AMP,
@@ -1548,7 +1631,14 @@ def plot_angular_power_spectrum_periodic(fig_dir: str) -> None:
     mock_idx = 0
     boxsize = 1000.0
     ngrid = NGRID_SYS
-    seed_dust = 42 + mock_idx * 10_000 + 2
+
+    seed_dust = None
+
+    if SEED is not None:
+        seed_dust = SEED
+
+    if seed_dust is None:
+        seed_dust = 42 + mock_idx * 10_000 + 2
     
     sys_map = gen_controlled_transverse_map(
         amp=SYS_AMP,
@@ -1744,6 +1834,72 @@ def plot_density_slices(fig_dir: str) -> None:
     print(f'Saved: {fpath}')
 
 
+def _compute_pkmu_with_jax(
+    positions: np.ndarray,
+    weights: np.ndarray,
+    randoms_positions: np.ndarray,
+    randoms_weights: np.ndarray,
+    los: str,
+    position_type: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute P(k,μ) using jax-power.
+
+    Returns kcen, pkmu arrays.
+    """
+    from jaxpower import (
+        MeshAttrs, ParticleField, BinMesh2SpectrumPoles,
+        compute_mesh2_spectrum
+    )
+    from nonunif_binning import compute_null_bins
+
+    print(f'[jax-power] Computing diagnostic P(k,μ) (position_type={position_type}, los={los})')
+
+    kedges = np.arange(K_MIN, K_MAX + DELTA_K, DELTA_K)
+    mu_wedges = compute_null_bins(np.max(ELLS), N_CLEAN_BINS)
+
+    # positions is shape (3, N); jaxpower expects (N, 3)
+    data_pos = positions.T
+    data_w = weights
+    rand_pos = randoms_positions.T
+    rand_w = randoms_weights
+
+    # Create mesh geometry
+    if position_type == 'xyz':
+        # Periodic box
+        mattrs = MeshAttrs(meshsize=NMESH, boxsize=1000.0)
+    else:
+        # Lightcone (rdd) — not used in this diagnostic, but keep for completeness
+        mattrs = MeshAttrs(meshsize=NMESH)
+
+    # Create binning configuration
+    bin_config = BinMesh2SpectrumPoles(mattrs, edges=kedges, ells=ELLS)
+
+    # Paint data and randoms to mesh
+    data_field = ParticleField(data_pos, data_w, attrs=mattrs)
+    rand_field = ParticleField(rand_pos, rand_w, attrs=mattrs)
+
+    # Paint to real space mesh
+    data_mesh = data_field.paint(resampler='tsc', interlacing=3, compensate=True)
+    rand_mesh = rand_field.paint(resampler='tsc', interlacing=3, compensate=True)
+
+    # FKP estimator: compute data - randoms mesh (element-wise subtraction)
+    fkp_mesh = data_mesh - rand_mesh
+
+    # Compute power spectrum
+    spectrum = compute_mesh2_spectrum(fkp_mesh, bin=bin_config, los=los)
+
+    kcen = np.asarray(spectrum.coords('k'))
+    plk = np.stack(
+        [np.asarray(spectrum.get(ell).power) for ell in ELLS],
+        axis=0,
+    )
+    plk_kell = np.moveaxis(plk, 0, 1)
+    pkmu = _poles_to_wedges(ELLS, plk_kell, mu_wedges)
+
+    return kcen, pkmu
+
+
 def plot_contaminant_pkmu(fig_dir: str) -> None:
     """
     Compute and plot the P(k,μ) power spectrum of the pure contamination field
@@ -1757,9 +1913,9 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     2. Create a uniform random catalog
     3. Weight galaxies by local contamination field value  
     4. Compute P(k,μ) using standard estimator
-    """
+    """ 
     from pypower import CatalogFFTPower
-    from nonunif_binning import compute_null_bins
+    from nonunif_binning import compute_null_bins, compute_window_corrected_mu_bins
     
     os.makedirs(fig_dir, exist_ok=True)
     mock_idx = 0
@@ -1767,7 +1923,15 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     ngrid_sys = NGRID_SYS
     
     # Generate the contamination field (2D transverse plane)
-    seed_dust = 42 + mock_idx * 10_000 + 2
+    # seed_dust = 42 + mock_idx * 10_000 + 2
+
+    seed_dust = None
+    if SEED is not None:
+        seed_dust = SEED
+
+    if seed_dust is None:
+        seed_dust = 42 + mock_idx * 10_000 + 2
+        
     sys_map = gen_controlled_transverse_map(
         amp=SYS_AMP,
         seed=seed_dust,
@@ -1807,31 +1971,40 @@ def plot_contaminant_pkmu(fig_dir: str) -> None:
     rand_weights = np.ones(n_randoms)
     
     # Compute power spectrum
-    # mu_wedges = np.linspace(0.0, 1.0, len(ELLS))
-
-    mu_wedges = compute_null_bins(np.max(ELLS), N_CLEAN_BINS)
+    mu_wedges = get_mu_wedges()
     print('Mu wedges:', mu_wedges)
     kedges = np.arange(K_MIN, K_MAX + DELTA_K, DELTA_K)
     print('k edges in plot contaminant Pkmu:', kedges)
 
-    edges = (kedges, mu_wedges)
-    
-    result = CatalogFFTPower(
-        data_positions1=pos_array,
-        data_weights1=weights,
-        randoms_positions1=rand_array,
-        randoms_weights1=rand_weights,
-        nmesh=NMESH,
-        los='z',
-        position_type='xyz',
-        resampler='tsc',
-        dtype='f8',
-        ells=ELLS,
-        edges=edges,
-    )
-    
-    pkmu = result.wedges.get_power().real
-    kcen = result.wedges.k[:, 0].real
+    if USE_JAX:
+        print('[jax-power] Computing contamination field P(k,μ) (periodic box)')
+        kcen, pkmu = _compute_pkmu_with_jax(
+            pos_array,
+            weights,
+            rand_array,
+            rand_weights,
+            los='z',
+            position_type='xyz',
+        )
+        pkmu = pkmu.real
+    else:
+        print('[pypower] Computing contamination field P(k,μ) (periodic box)')
+        edges = (kedges, mu_wedges)
+        result = CatalogFFTPower(
+            data_positions1=pos_array,
+            data_weights1=weights,
+            randoms_positions1=rand_array,
+            randoms_weights1=rand_weights,
+            nmesh=NMESH,
+            los='z',
+            position_type='xyz',
+            resampler='tsc',
+            dtype='f8',
+            ells=ELLS,
+            edges=edges,
+        )
+        pkmu = result.wedges.get_power().real
+        kcen = result.wedges.k[:, 0].real
     nmu = len(mu_wedges) - 1
     
     fig = plt.figure(figsize=(6, 5))
@@ -1900,7 +2073,16 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
     redshift = redshift[redshift_sel]
     
     # Generate the contamination field (HEALPix full-sky map)
-    seed_dust = 42 + mock_idx * 10_000 + 2
+    # seed_dust = 42 + mock_idx * 10_000 + 2
+
+    seed_dust = None
+    if SEED is not None:
+        seed_dust = SEED
+
+    if seed_dust is None:
+        seed_dust = 42 + mock_idx * 10_000 + 2
+
+    print('seed dust in plot_contaminant_pkmu_halfdome is ', seed_dust)
     sys_map = gen_controlled_transverse_map(
         amp=SYS_AMP,
         seed=seed_dust,
@@ -1981,36 +2163,46 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
     rand_weights = np.ones(n_randoms)
     
     # Build k and mu bins using same config as data
-    mu_wedges = compute_null_bins(np.max(ELLS), N_CLEAN_BINS)
+    mu_wedges = get_mu_wedges()
     kedges = np.arange(K_MIN, K_MAX + DELTA_K, DELTA_K)
-    edges = (kedges, mu_wedges)
-    
+
     print(f'Mu wedges: {mu_wedges}')
     print(f'K edges: {kedges[:5]}...{kedges[-5:]}')
-    
-    # Compute power spectrum using spherical (rdd) coordinates for lightcone
-    result = CatalogFFTPower(
-        data_positions1=pos_array,
-        data_weights1=weights,
-        randoms_positions1=rand_array,
-        randoms_weights1=rand_weights,
-        nmesh=NMESH,
-        los='endpoint',
-        position_type='rdd',
-        resampler='tsc',
-        dtype='f8',
-        ells=ELLS,
-        edges=kedges,
-        interlacing=2,
-        shotnoise=None,
-        mpiroot=0,
-    )
-    
-    plk = result.poles.get_power()                      # shape usually (nell, nk)
-    kcen = result.poles.k                         # shape (nk,)
-    plk_kell = np.moveaxis(plk, 0, 1)            # -> (nk, nell)
-    
-    pkmu = _poles_to_wedges(ELLS, plk_kell, mu_wedges)  # (nk, nmu)
+
+    if USE_JAX:
+        print('[jax-power] Computing contamination field P(k,μ) (halfdome lightcone)')
+        kcen, pkmu = _compute_pkmu_with_jax(
+            pos_array,
+            weights,
+            rand_array,
+            rand_weights,
+            los='firstpoint',
+            position_type='rdd',
+        )
+        pkmu_from_pypower = None  # Not computed for jax version
+    else:
+        print('[pypower] Computing contamination field P(k,μ) (halfdome lightcone)')
+        result = CatalogFFTPower(
+            data_positions1=pos_array,
+            data_weights1=weights,
+            randoms_positions1=rand_array,
+            randoms_weights1=rand_weights,
+            nmesh=NMESH,
+            los='firstpoint',
+            position_type='rdd',
+            resampler='tsc',
+            dtype='f8',
+            ells=ELLS,
+            edges=kedges,
+            interlacing=3,
+            shotnoise=None,
+            mpiroot=0,
+        )
+        plk = result.poles.get_power()
+        kcen = result.poles.k
+        plk_kell = np.moveaxis(plk, 0, 1)
+        pkmu_from_pypower = result.poles.to_wedges(mu_wedges).get_power()
+        pkmu = _poles_to_wedges(ELLS, plk_kell, mu_wedges)
     
 
     nmu = len(mu_wedges) - 1
@@ -2022,6 +2214,13 @@ def plot_contaminant_pkmu_halfdome(fig_dir: str) -> None:
         kp = kcen * pkmu[:, mu_idx]
         plt.plot(kcen, kp, 'o-', linewidth=2, markersize=4, color=cmap(mu_idx / nmu),
                 label=f'μ ∈ [{mu_wedges[mu_idx]:.2f}, {mu_wedges[mu_idx+1]:.2f}]')
+
+        # if pkmu_from_pypower is not None:
+        #     print('pkmu_from_pypower / pkmu my own: for mu idx', mu_idx, pkmu_from_pypower[:,mu_idx]/pkmu[:,mu_idx])
+        #     kp_pypower = kcen * pkmu_from_pypower[:,mu_idx]
+        #     plt.plot(kcen, kp_pypower, '--', linewidth=2, markersize=4, color=cmap(mu_idx / nmu),
+        #             label=f'μ ∈ [{mu_wedges[mu_idx]:.2f}, {mu_wedges[mu_idx+1]:.2f}]')
+        
     
     plt.ylabel(r'$k P(k,\mu)$ [$({\rm Mpc}/h)^2$]', fontsize=11)
     plt.yscale('log')
@@ -2047,7 +2246,8 @@ def parse_args():
     global RUN_NAME, NMOCK, SAVE_DIR, FIG_DIR, SYS_AMP, SYS_SPEC_TYPE, SYS_AMP_MODE, SYS_AMP_MULT_SCALE
     global SYS_ELL_MIN, SYS_ELL_MAX, SYS_ELL_DELTA, DS_FAC, NMESH, NO_CACHE, CLEAR
     global WITH_RSD, MOCK_TYPE, N_SAMPLE, TARGET_NBAR, PLOT_YSCALE, PLOT_YLIM_MIN, PLOT_YLIM_MAX, PLOT_YSCALE_PS, PLOT_YLIM_PS_MIN, PLOT_YLIM_PS_MAX, VERBOSE_LOGGING
-    global K_MIN, K_MAX, DELTA_K, Z_MIN, Z_MAX, MODES_TO_RUN, MEAN_CONSERVING_ADDITIVE, APPLY_SYS_TO_RANDOMS, GAL_LAT_CUT_DEG
+    global K_MIN, K_MAX, DELTA_K, Z_MIN, Z_MAX, MODES_TO_RUN, MEAN_CONSERVING_ADDITIVE, APPLY_SYS_TO_RANDOMS, GAL_LAT_CUT_DEG, USE_JAX, USE_RADIAL_WINDOW
+    global COMPUTE_WINDOW, WINDOW_METHOD
 
     p = argparse.ArgumentParser(
         description='Controlled transverse systematic test on Quijote mocks.',
@@ -2088,6 +2288,8 @@ def parse_args():
                    help='Force recompute even if a cached npz already exists.')
     p.add_argument('--clear',  action='store_true',
                    help='Remove all cached results for this run before starting.')
+    p.add_argument('--plot-only', action='store_true',
+                   help='skips some calculations in plot-only mode.')
     p.add_argument('--with-rsd', action='store_true',
                    help='Use RSD galaxy positions (z-axis LOS). Default is real-space positions.')
     p.add_argument('--mock-type', default='quijote', choices=['quijote', 'halfdome'],
@@ -2129,6 +2331,22 @@ def parse_args():
     p.add_argument('--gal-lat-cut', type=float, default=0.0, metavar='DEG',
                    help='Remove galaxies with |b| < DEG from data, randoms, and contamination map. '
                         '0 = no cut (default). Recommended: 20 for Gaia stellar template.')
+    p.add_argument('--test-poles-to-wedges', action='store_true',
+                   help='Run diagnostic test comparing _poles_to_wedges() with result.wedges.get_power() '
+                        'for periodic box geometry. Exits after test completes.')
+    p.add_argument('--diagnose-matrix', action='store_true',
+                   help='Analyze the poles→wedges transformation matrix and its numerical properties. '
+                        'Exits after diagnosis completes.')
+    p.add_argument('--use-jax', action='store_true',
+                   help='Use jax-power instead of pypower for power spectrum estimation.')
+    p.add_argument('--no-radial-window', action='store_true',
+                   help='Disable window-corrected mu bins for halfdome. '
+                        'Default: True for halfdome (False for quijote). '
+                        'NOTE: Ignored for quijote mock_type and for delta-function systematics '
+                        '(which always use radial window corrections to match analytical binning).')
+    p.add_argument('--compute-window', action='store_true')
+    p.add_argument('--window-method', default='fft', choices=['fft', 'smooth'])
+    
     args = p.parse_args()
 
     if args.spec_type == 'delta' and args.ell_delta is None:
@@ -2166,9 +2384,17 @@ def parse_args():
     MEAN_CONSERVING_ADDITIVE = not args.legacy_additive
     APPLY_SYS_TO_RANDOMS     = args.apply_sys_to_randoms
     GAL_LAT_CUT_DEG          = args.gal_lat_cut
+    USE_JAX                  = args.use_jax
+    # For delta-function systematics with halfdome, always use radial window corrections
+    # (matching the analytical approach in delta_ell_systematic_analysis.py)
+    USE_RADIAL_WINDOW = (MOCK_TYPE == 'halfdome') and (SYS_SPEC_TYPE == 'delta' or not args.no_radial_window)
+    COMPUTE_WINDOW = args.compute_window
+    WINDOW_METHOD = args.window_method
     SAVE_DIR      = os.path.join('data/plk/transverse_sys_test', RUN_NAME)
     FIG_DIR       = os.path.join('figures/transverse_sys_test', RUN_NAME)
-    if VERBOSE_LOGGING:
+    if VERBOSE_LOGGING and not USE_JAX:
+        # Only load pypower if we're using verbose logging with pypower
+        from pypower import setup_logging
         setup_logging()
     return args
 
@@ -2268,7 +2494,28 @@ def plot_halfdome_celestial_diagnostics(fig_dir: str) -> None:
 
 
 def main():
-    parse_args()
+    global COMPUTED_MU_WEDGES
+    args = parse_args()
+    
+    # Compute and cache mu_wedges upfront so all plotting functions use the same binning
+    COMPUTED_MU_WEDGES = get_mu_wedges()
+    print(f'[main] Computed mu_wedges: {COMPUTED_MU_WEDGES}')
+    print()
+    
+    # Run diagnostic tests if requested
+    if args.diagnose_matrix:
+        print('\nRunning matrix diagnostics...')
+        diagnose_poles_to_wedges_matrix()
+        print('\nDiagnosis completed.')
+        sys.exit(0)
+    
+    if args.test_poles_to_wedges:
+        print('\nRunning diagnostic test: _poles_to_wedges vs result.wedges.get_power()...')
+        test_result = test_poles_to_wedges_periodic()
+        exit_code = 0 if test_result else 1
+        print(f'\nTest completed with exit code {exit_code}.')
+        sys.exit(exit_code)
+    
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(FIG_DIR, exist_ok=True)
 
@@ -2305,10 +2552,12 @@ def main():
         plot_angular_power_spectrum_healpix(FIG_DIR)
 
     print('Generating contamination field P(k,μ) power spectrum...')
-    if MOCK_TYPE == 'quijote':
-        plot_contaminant_pkmu(FIG_DIR)
-    # elif MOCK_TYPE == 'halfdome':
-        # plot_contaminant_pkmu_halfdome(FIG_DIR)
+
+    if not args.plot_only:
+        if MOCK_TYPE == 'quijote':
+            plot_contaminant_pkmu(FIG_DIR)
+        elif MOCK_TYPE == 'halfdome':
+            plot_contaminant_pkmu_halfdome(FIG_DIR)
 
     print('Generating galaxy density visualization...')
     if MOCK_TYPE == 'quijote':
