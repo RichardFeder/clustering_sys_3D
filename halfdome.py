@@ -44,7 +44,7 @@ def load_lightcone_positions_redshift(filepath, subsample_factor=100):
     return positions, redshifts
 
 
-def load_lightcone_subset(filepath, n_sample=None, from_first_n=None):
+def load_lightcone_subset(filepath, n_sample=None, from_first_n=None, seed=None):
     """
     Efficiently load a subsample of Position and redshift from a large halo lightcone.
 
@@ -56,6 +56,8 @@ def load_lightcone_subset(filepath, n_sample=None, from_first_n=None):
         Total number of halos to load (after subsampling).
     from_first_n : int
         How many rows to read from the file before subsampling.
+    seed : int, optional
+        Random seed for reproducible sampling. If None, uses default random state.
 
     Returns
     -------
@@ -80,13 +82,13 @@ def load_lightcone_subset(filepath, n_sample=None, from_first_n=None):
     if n_sample is None:
         n_sample = n_read
     
-    # Subsample in memory
+    # Subsample in memory with optional seeding for reproducibility
     if n_sample >= n_read:
         # Return everything read
         return pos, z
     else:
-        
-        idx = np.random.choice(n_read, size=n_sample, replace=False)
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(n_read, size=n_sample, replace=False)
         return pos[idx], z[idx]
 
 

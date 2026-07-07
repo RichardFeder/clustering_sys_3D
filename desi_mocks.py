@@ -178,12 +178,9 @@ class desi_mock():
         if with_RSD:
             fpath = fpath.replace('Position', 'RSDPosition')
         
-        print('fpath is ', fpath)
         galpos = np.load(fpath)
 
         boxdims = [np.max(galpos[:,i]) for i in range(3)]
-
-        print('boxdims:', boxdims)
 
         boxlength = np.mean(boxdims)
 
@@ -206,12 +203,12 @@ class desi_mock():
         return galpos
 
 
-    def load_halfdome_mock(self, mockidx, n_sample=None):
+    def load_halfdome_mock(self, mockidx, n_sample=None, seed=None):
 
         mockidx_use = 100+2*mockidx
         lightcone_fpath = self.halfdome_mock_basedir+'lightcone_'+str(mockidx_use)+'.hdf5'
 
-        positions, redshifts = load_lightcone_subset(lightcone_fpath, n_sample=n_sample)
+        positions, redshifts = load_lightcone_subset(lightcone_fpath, n_sample=n_sample, seed=seed)
 
         return positions, redshifts
 
@@ -334,9 +331,9 @@ def apply_healpix_mask(galpos_mpc_per_h: np.ndarray, L_box_mpc_per_h: float, h_v
         x, y, z coordinates (in Mpc/h) of the galaxies that fall within the
         specified HEALPix mask.
     """
-    print("--- Starting HEALPix Mask Application ---")
-    print(f"Input box size: {L_box_mpc_per_h:.2f} Mpc/h")
-    print(f"Using h = {h_value:.3f}")
+    # print("--- Starting HEALPix Mask Application ---")
+    # print(f"Input box size: {L_box_mpc_per_h:.2f} Mpc/h")
+    # print(f"Using h = {h_value:.3f}")
 
     # Convert coordinates and box size from Mpc/h to Mpc
     x_orig_mpc = galpos_mpc_per_h[:, 0] * h_value
@@ -344,7 +341,7 @@ def apply_healpix_mask(galpos_mpc_per_h: np.ndarray, L_box_mpc_per_h: float, h_v
     z_orig_mpc = galpos_mpc_per_h[:, 2] * h_value
     L_box_mpc = L_box_mpc_per_h * h_value
 
-    print(f"Converted box size: {L_box_mpc:.2f} Mpc")
+    # print(f"Converted box size: {L_box_mpc:.2f} Mpc")
 
     # Translate coordinates to be relative to the box center (observer at 0,0,0)
     center_offset_mpc = L_box_mpc / 2.0
