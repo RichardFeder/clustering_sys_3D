@@ -76,19 +76,31 @@ $PYBIN run_transverse_sys_test.py \
 
 OMP_NUM_THREADS=8 $PYBIN run_transverse_sys_test.py  \
      --mock-type halfdome --n-sample 20000000 --target-nbar 1e-4   \
-           --nmesh 256 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1 \
-             --spec-type power_law   --sys-amp 0.02   --nmock 5 --plot-yscale log --plot-ylim-min 0.1 \
-              --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 10000 --plot-yscale-ps log
+           --nmesh 512 --delta-k 0.005 --k-min 0.002 --k-max 0.2 --run-name power_law_halfdome_v1_lowz_evenl_firstpoint \
+             --spec-type power_law   --sys-amp 0.02   --nmock 1 --plot-ylim-min 0.1 \
+              --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 1300 --plot-only
 
 
 
-OMP_NUM_THREADS=8 $PYBIN run_transverse_sys_test.py  \
+OMP_NUM_THREADS=4 $PYBIN run_transverse_sys_test.py  \
      --mock-type halfdome --n-sample 40000000 --target-nbar 3e-4   \
-           --z-min 0.1 --z-max 0.4 --nmesh 128 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1_lowz_snsub \
+           --z-min 0.1 --z-max 0.4 --nmesh 256 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1_lowz_snsub \
              --spec-type power_law   --sys-amp 0.02   --nmock 2 --plot-yscale log --plot-ylim-min 0.1 \
               --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 10000 --plot-yscale-ps log
 
 
+$PYBIN run_transverse_sys_test.py       --mock-type halfdome --n-sample 20000000 --target-nbar 1e-4              --nmesh 256 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v2_lowz_evenl_firstpoint_256              --spec-type power_law   --sys-amp 0.02   --nmock 2 
+--plot-ylim-min 0.1               --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 1300 --z-min 0.1 --z-max 0.4
+
+
+
+# use JAX version
+
+$PYBIN run_transverse_sys_test.py  \
+     --mock-type halfdome --n-sample 40000000 --target-nbar 3e-4   \
+           --z-min 0.1 --z-max 0.4 --nmesh 256 --delta-k 0.005 --k-min 0.002 --k-max 0.15 --run-name power_law_halfdome_v1_lowz_jax \
+             --spec-type power_law   --sys-amp 0.02   --nmock 1 --plot-yscale log --plot-ylim-min 0.1 \
+              --plot-ylim-max 1e2 --plot-ylim-ps-min 0 --plot-ylim-ps-max 10000 --plot-yscale-ps log --use-jax
 
 
 # 2b. Same but with RSD

@@ -7,13 +7,42 @@ from astropy.coordinates import FK5, FK4 # Import these for potential transforma
 
 
 def load_gaia_stellar_density(fpath=None, plot=True, vmax=500):
-
-    if fpath is None:
-        fpath = 'stars/stellar_density_map_12_lt_g_lt_17.npy'
+    """
+    Load Gaia stellar density map as a HEALPix map (nside=128).
     
-    stellar_map = np.load(fpath)
+    First tries the SPHEREx-masked FITS version (nside=128, G=19-20 mag band).
+    Falls back to legacy .npy file if FITS not found.
+    
+    Parameters
+    ----------
+    fpath : str, optional
+        Path to map file (.fits or .npy). Default tries masked FITS first.
+    plot : bool, optional
+        Whether to display mollview projection. Default True.
+    vmax : float, optional
+        Maximum value for mollview colorbar. Default 500.
+    
+    Returns
+    -------
+    stellar_map : ndarray
+        HEALPix map with 196608 pixels (nside=128).
+    """
+    import os
+    
+    if fpath is None:
+        # Try new SPHEREx-masked FITS version first (has SPHEREx masks applied)
+        fits_default = 'data/gaia_star_G_19_20.fits'
+        npy_default = 'stars/stellar_density_map_12_lt_g_lt_17.npy'
+        fpath = fits_default if os.path.exists(fits_default) else npy_default
+    
+    # Load based on file extension
+    if fpath.endswith('.fits'):
+        stellar_map = hp.read_map(fpath)
+    else:
+        stellar_map = np.load(fpath)
+    
     if plot:
-        hp.mollview(stellar_map, title='Gaia stellar density, $12 < G < 17$', max=vmax)
+        hp.mollview(stellar_map, title='Gaia stellar density (SPHEREx-masked)', max=vmax)
         plt.show()
 
     return stellar_map
