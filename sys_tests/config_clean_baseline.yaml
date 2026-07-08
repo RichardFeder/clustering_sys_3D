@@ -1,0 +1,42 @@
+# sys_tests/config_clean_baseline.yaml
+# Configuration for computing clean baseline multipoles
+
+# Redshift range
+redshift:
+  zmin: 0.2
+  zmax: 0.5
+
+# Mesh resolution
+mesh:
+  nmesh: 256
+
+# Multipole configuration
+multipoles:
+  ells: [0, 2, 4, 6, 8, 10, 12, 14, 16]
+  ell_min_compute: 0
+  ell_max_compute: 16
+
+# k-binning
+k_range:
+  k_min: 0.006
+  k_max: 0.2
+  delta_k: 0.01
+
+# Clean sample binning
+binning:
+  n_clean_bins: 8
+  mu_binning_strategy: nonuniform
+
+# Mocks
+mocks:
+  nmock: 3
+  n_sample: 20_000_000
+  target_nbar: 0.0003          # null = use catalog density; or specify e.g. 3e-4
+  ds_fac: 5
+  seed: 42
+  with_rsd: false
+
+# Output
+output:
+  save_dir: cache
+  verbose: true

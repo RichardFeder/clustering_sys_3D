@@ -1,0 +1,42 @@
+# sys_tests/config_contaminant_deltafn.yaml
+# Configuration for computing contaminated multipoles with delta-function systematic
+
+# Redshift range (should match clean baseline)
+redshift:
+  zmin: 0.1
+  zmax: 0.4
+
+# Contamination systematic
+systematic:
+  type: delta_function    # or 'power_law'
+  
+  # Delta-function parameters
+  # Single ell_contam value
+  ell_contam: 6          # Multipole where delta-function spike occurs
+  amplitude: 0.01        # sys_amp (amplitude of the spike)
+  
+  # OR list of ell values for multiple spikes (commented out)
+  # ell_contam_list: [2, 6, 20, 60, 100, 300]
+  # amplitude: 0.05
+  
+  # Contamination mode
+  mode: transverse_additive   # 'transverse_additive' or 'transverse_multiplicative'
+  mean_conserving: true       # For additive: conserve mean?
+  
+  # For delta functions, these are typically not used but kept for compatibility
+  ell_min: null
+  ell_max: null
+  ell_delta: null
+
+# Mocks
+mocks:
+  nmock: 5
+  n_sample: 20_000_000
+  target_nbar: 0.0003          # null = use catalog density; or specify e.g. 3e-4
+  ds_fac: 5
+  seed: 42
+
+# Output
+output:
+  save_dir: cache
+  verbose: true

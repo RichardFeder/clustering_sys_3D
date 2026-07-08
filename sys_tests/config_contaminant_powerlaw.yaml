@@ -1,0 +1,37 @@
+# sys_tests/config_contaminant_powerlaw.yaml
+# Configuration for computing contaminated multipoles with power-law systematic
+
+# Redshift range (should match clean baseline)
+redshift:
+  zmin: 0.1
+  zmax: 0.4
+
+# Contamination systematic
+systematic:
+  type: power_law          # or 'delta_function'
+  
+  # Power-law parameters
+  amplitude: 0.01         # sys_amp
+  alpha: -2.0             # Power-law slope (e.g., -2.0, -1.5)
+  
+  # Contamination mode
+  mode: transverse_additive   # 'transverse_additive' or 'transverse_multiplicative'
+  mean_conserving: true       # For additive: conserve mean?
+  
+  # ell range for systematic
+  ell_min: 6
+  ell_max: 64
+  ell_delta: null
+
+# Mocks
+mocks:
+  nmock: 5
+  n_sample: 20_000_000
+  target_nbar: null          # null = use catalog density; or specify e.g. 3e-4
+  ds_fac: 5
+  seed: 42
+
+# Output
+output:
+  save_dir: cache
+  verbose: true

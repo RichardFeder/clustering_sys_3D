@@ -1275,14 +1275,13 @@ def _compute_raw_multipoles(
             kcen = result.wedges.k[:, 0]
             shot_noise = result.poles.shotnoise
 
-        # Transpose to (nk, nell) format
-        plk_kell = np.moveaxis(plk, 0, 1)
-        if plk_kell.shape[1] != len(spec.ells):
+        # plk has natural shape from pypower: (nell, nk)
+        if plk.shape[0] != len(spec.ells):
             raise ValueError(
-                f"Pole array mismatch: expected (nk, {len(spec.ells)}), got {plk_kell.shape}"
+                f"Pole array mismatch: expected ({len(spec.ells)}, nk), got {plk.shape}"
             )
 
-        return kcen, plk_kell, shot_noise
+        return kcen, plk, shot_noise
 
     except Exception as e:
         raise ValueError(f"Failed to compute raw multipoles: {e}")
@@ -1302,7 +1301,7 @@ def _reconstruct_pkmu_from_poles(
     Parameters
     ----------
     all_plk : np.ndarray
-        Power spectrum multipoles, shape (nk, nell)
+        Power spectrum multipoles, shape (nell, nk)
     ells : tuple
         Multipole orders, length nell
     mu_wedges : np.ndarray
@@ -1320,16 +1319,18 @@ def _reconstruct_pkmu_from_poles(
     """
     try:
         if all_plk.ndim != 2:
-            raise ValueError(f"all_plk must be 2D (nk, nell), got shape {all_plk.shape}")
-        nk, nell = all_plk.shape
+            raise ValueError(f"all_plk must be 2D (nell, nk), got shape {all_plk.shape}")
+        nell, nk = all_plk.shape
         if nell != len(ells):
             raise ValueError(
-                f"all_plk has {nell} ell columns but expected {len(ells)} (ells={ells})"
+                f"all_plk has {nell} ell rows but expected {len(ells)} (ells={ells})"
             )
         if len(mu_wedges) < 2:
             raise ValueError(f"mu_wedges must have at least 2 edges, got {len(mu_wedges)}")
 
-        pkmu = _poles_to_wedges(ells, all_plk, mu_wedges)
+        # Transpose (nell, nk) -> (nk, nell) for _poles_to_wedges
+        plk_kell = all_plk.T
+        pkmu = _poles_to_wedges(ells, plk_kell, mu_wedges)
         if pkmu.shape != (nk, len(mu_wedges) - 1):
             raise ValueError(
                 f"pkmu reconstruction failed: expected shape (nk={nk}, nmu={len(mu_wedges)-1}), got {pkmu.shape}"
@@ -1384,9 +1385,9 @@ def _compute_power_spectra(
             spec, catalog, rand_positions, rand_weights
         )
 
-        if kcen.shape[0] != all_plk.shape[0]:
+        if kcen.shape[0] != all_plk.shape[1]:
             raise ValueError(
-                f"kcen and all_plk mismatch: {kcen.shape[0]} vs {all_plk.shape[0]}"
+                f"kcen and all_plk mismatch: kcen.shape={kcen.shape}, all_plk.shape={all_plk.shape}"
             )
 
         # 2) Compute mu wedges for target binning strategy

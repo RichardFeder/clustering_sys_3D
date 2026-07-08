@@ -361,7 +361,10 @@ def gen_controlled_transverse_map(amp, nside=256, seed=None, spec_type='power_la
             mask = ells >= max(ell_min, 1)
             cl[mask] = 1.0 / ells[mask] ** 2
         elif spec_type == 'delta':
-            if ell_min <= ell_delta <= min(ell_max, lmax):
+            if ell_min is not None and ell_max is not None:
+                if ell_min <= ell_delta <= min(ell_max, lmax):
+                    cl[ell_delta] = 1.0
+            else:
                 cl[ell_delta] = 1.0
         else:
             raise ValueError(f"Unknown spec_type='{spec_type}'. Use 'flat', 'power_law', or 'delta'.")
