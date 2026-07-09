@@ -18,7 +18,7 @@ systematic:
   # OR list of ell values for multiple spikes (commented out)
   # ell_contam_list: [2, 6, 20, 60, 100, 300]
   # amplitude: 0.05
-  
+   
   # Contamination mode
   mode: transverse_additive   # 'transverse_additive' or 'transverse_multiplicative'
   mean_conserving: true       # For additive: conserve mean?

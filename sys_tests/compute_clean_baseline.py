@@ -53,6 +53,8 @@ from pipeline import (
     run_single_experiment,
     save_experiment_result,
 )
+from desi_mocks import desi_mock
+from utils import convert_to_ra_dec_distance
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,77 @@ def _write_rerun_script(path: str, command: str) -> None:
 def _build_rerun_command(script_path: str, argv: Tuple[str, ...]) -> str:
     quoted = " ".join(shlex.quote(a) for a in argv)
     return f'source ~/.desi_bashrc && "$PYBIN" {shlex.quote(script_path)} {quoted}'.rstrip()
+
+
+def plot_mock_density_healpix(
+    mock_idx: int,
+    config_cache_dir: str,
+    zmin: float,
+    zmax: float,
+) -> None:
+    """Generate a healpix density visualization for one mock realization.
+    
+    Parameters
+    ----------
+    mock_idx : int
+        Mock index to visualize
+    config_cache_dir : str
+        Output directory for the config
+    zmin, zmax : float
+        Redshift range for mock
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+        import healpy as hp
+    except ImportError:
+        logger.warning("healpy or matplotlib not available; skipping density visualization")
+        return
+    
+    try:
+        # Load one halfdome mock realization
+        dm = desi_mock()
+        from pipeline import DEFAULT_HALFDOME_BASEDIR
+        dm.halfdome_mock_basedir = DEFAULT_HALFDOME_BASEDIR
+        galpos, redshift = dm.load_halfdome_mock(mock_idx, n_sample=500_000)
+        
+        # Convert to RA/Dec
+        boxsize = 1000.0
+        ra, dec, r = convert_to_ra_dec_distance(galpos, boxsize, center_offset_mpc=0.0)
+        
+        # Create healpix map
+        nside = 128  # healpix resolution
+        npix = hp.nside2npix(nside)
+        
+        # Convert RA/Dec to HEALPix pixel indices
+        theta = np.radians(90.0 - dec)  # colatitude from Dec
+        phi = np.radians(ra)             # azimuth from RA
+        pix = hp.ang2pix(nside, theta, phi)
+        
+        # Count galaxies per pixel
+        gal_density = np.zeros(npix)
+        np.add.at(gal_density, pix, 1)
+        
+        # Normalize by pixel area to get surface density
+        pixel_area = hp.nside2pixarea(nside, degrees=True)
+        gal_density /= pixel_area
+        
+        # Create figure
+        fig = plt.figure(figsize=(10, 6))
+        hp.mollview(gal_density, fig=fig, title=f"Mock #{mock_idx}: Galaxy Density (z={zmin}-{zmax})",
+                   cmap="viridis", format="%.2e")
+        
+        # Save figure
+        fig_dir = os.path.join(config_cache_dir, "figures")
+        os.makedirs(fig_dir, exist_ok=True)
+        fig_path = os.path.join(fig_dir, f"galaxy_density_healpix_mock{mock_idx}.png")
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        
+        logger.info(f"Saved density visualization: {fig_path}")
+    except Exception as e:
+        logger.warning(f"Failed to generate density visualization: {e}")
 
 
 def _load_yaml_config(config_path: Optional[str]) -> Dict[str, Any]:
@@ -377,6 +450,10 @@ def main() -> None:
             np.savez(agg_path, all_plk=all_plk_agg, ells=np.asarray(ells), kcen=kcen)
             logger.info(f"Aggregated {len(all_plk_agg_list)} mocks -> {agg_path}")
             logger.info(f"Aggregated shape: {all_plk_agg.shape}")
+        
+        # Generate density visualization for first computed mock
+        if mocks_to_run:
+            plot_mock_density_healpix(mocks_to_run[0], config_cache_dir, zmin, zmax)
         
         # Save metadata
         yaml_path = os.path.join(config_cache_dir, "config.yaml")

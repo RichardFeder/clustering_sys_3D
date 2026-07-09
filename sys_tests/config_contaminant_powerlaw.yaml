@@ -27,7 +27,7 @@ systematic:
 mocks:
   nmock: 5
   n_sample: 20_000_000
-  target_nbar: null          # null = use catalog density; or specify e.g. 3e-4
+  target_nbar: 0.0003          # null = use catalog density; or specify e.g. 3e-4
   ds_fac: 5
   seed: 42
 

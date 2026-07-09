@@ -3,8 +3,8 @@
 
 # Redshift range
 redshift:
-  zmin: 0.2
-  zmax: 0.5
+  zmin: 0.4
+  zmax: 0.8
 
 # Mesh resolution
 mesh:
@@ -18,9 +18,9 @@ multipoles:
 
 # k-binning
 k_range:
-  k_min: 0.006
+  k_min: 0.002
   k_max: 0.2
-  delta_k: 0.01
+  delta_k: 0.005
 
 # Clean sample binning
 binning:
@@ -29,7 +29,7 @@ binning:
 
 # Mocks
 mocks:
-  nmock: 3
+  nmock: 10
   n_sample: 20_000_000
   target_nbar: 0.0003          # null = use catalog density; or specify e.g. 3e-4
   ds_fac: 5
