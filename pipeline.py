@@ -122,6 +122,10 @@ class ExperimentSpec:
     # in the same region. Applied uniformly to clean and contaminated catalogs so
     # the ratio P_contam/P_clean is not affected by the Galactic-plane mask.
     gal_lat_cut_deg: float = 0.0
+    # Generate a uniform Poisson-sampled catalog at constant comoving density,
+    # rather than loading structured mocks. Used for "contaminant-only" tests
+    # where the baseline should be pure shot noise with no large-scale structure.
+    generate_uniform_catalog: bool = False
 
 
 @dataclass
@@ -327,6 +331,7 @@ def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> Dict[str, int]:
     stellar_radec: angular position sampling within pixels (and injection add step)
     stellar_redshift: radial distance resampling for injected sources
     randoms      : uniform random catalog generation
+    regenerate_radii: radial distance resampling for uniform catalogs after contamination
     """
     base = int(spec.seed) + mock_idx * 10_000
     return {
@@ -336,6 +341,7 @@ def _stage_seeds(spec: ExperimentSpec, mock_idx: int) -> Dict[str, int]:
         'stellar_radec': base + 4,
         'stellar_redshift': base + 5,
         'randoms': base + 6,
+        'regenerate_radii': base + 7,
     }
 
 
@@ -495,6 +501,77 @@ def _apply_healpix_mask_to_catalog(catalog: PreparedCatalog, mask: np.ndarray, n
     print(f'  Gaia coverage mask applied: {n_before:,} → {n_after:,} galaxies')
     
     return catalog
+
+
+def _prepare_uniform_poisson_catalog(spec: ExperimentSpec, mock_idx: int) -> PreparedCatalog:
+    """Generate a uniform Poisson-sampled catalog at constant comoving density.
+    
+    This produces a catalog with no large-scale structure, only shot noise.
+    Useful for "contaminant-only" tests where the baseline should be pure Poisson
+    and all observed power comes from the applied systematic.
+    
+    Parameters
+    ----------
+    spec : ExperimentSpec
+        Experiment specification (must have zmin, zmax, target_nbar or n_sample)
+    mock_idx : int
+        Mock index for seeding RNG
+    
+    Returns
+    -------
+    catalog : PreparedCatalog
+        Uniform Poisson catalog with positions (RA, Dec, r) and unit weights
+    """
+
+    import astropy.units as u
+    seeds = _stage_seeds(spec, mock_idx)
+    rng = np.random.default_rng(seeds['quijote'])
+    
+    # Compute redshift bounds and comoving distances
+    chi_interp = grab_chi_interp()
+    r_min = chi_interp(spec.zmin)
+    r_max = chi_interp(spec.zmax)
+    
+    # Volume of full-sky spherical shell (Mpc/h)^3
+    vol_full_sky = (4.0 * np.pi / 3.0) * (r_max**3 - r_min**3)
+    
+    # Determine target number of galaxies
+    if spec.target_nbar is not None:
+        print('computing on the fly..', spec.target_nbar, vol_full_sky)
+        n_gal = int(spec.target_nbar * vol_full_sky)
+    else:
+        print('nsample:', spec.n_sample, vol_full_sky)
+
+        n_gal = spec.n_sample
+    
+    print(f'Generating uniform Poisson catalog: V={vol_full_sky:.3e} (Mpc/h)^3, n_gal={n_gal:,}')
+    
+    # Generate uniform RA/Dec on full sky
+    ra = rng.uniform(0.0, 360.0, size=n_gal)
+    
+    # Uniform sin(Dec) for isotropic spherical distribution
+    sin_dec = rng.uniform(-1.0, 1.0, size=n_gal)
+    dec = np.degrees(np.arcsin(sin_dec))
+    
+    # Uniform comoving distance in [r_min, r_max]
+    r = rng.uniform(r_min, r_max, size=n_gal)
+    
+    # Convert to redshift for reference
+    z = comoving_distance_to_redshift(r / cosmo.h * u.Mpc, chi_interp)
+    
+    positions_rdd = np.vstack([ra, dec, r])
+    weights = np.ones_like(ra, dtype=float)
+    
+    print(f'  Uniform catalog shape: {positions_rdd.shape}, r range: [{r_min:.1f}, {r_max:.1f}] Mpc/h')
+    
+    return PreparedCatalog(
+        positions_rdd=positions_rdd,
+        weights=weights,
+        base_redshifts=z,
+        base_r=r,
+        mock_idx=mock_idx,
+        metadata={'boxsize_use': spec.boxsize, 'uniform_catalog': True},
+    )
 
 
 def _prepare_halfdome_catalog(spec: ExperimentSpec, mock_idx: int, dm: desi_mock) -> PreparedCatalog:
@@ -673,10 +750,118 @@ def _get_or_compute_contamination_map(
     return sys_map
 
 
+def plot_contamination_healpix_residual(
+    positions_before: np.ndarray,
+    positions_after: np.ndarray,
+    mock_idx: int,
+    config_cache_dir: str,
+    zmin: float,
+    zmax: float,
+    nside: int = 128,
+) -> None:
+    """Plot angular density difference (contaminated - uniform) on HEALPix map.
+    
+    Parameters
+    ----------
+    positions_before : np.ndarray
+        Pre-contamination catalog positions (3, N) with (RA, Dec, r)
+    positions_after : np.ndarray
+        Post-contamination catalog positions (3, N) with (RA, Dec, r)
+    mock_idx : int
+        Mock index for labeling
+    config_cache_dir : str
+        Output directory for figures
+    zmin, zmax : float
+        Redshift range for title
+    nside : int
+        HEALPix resolution (default 128)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+    except ImportError:
+        print("matplotlib not available; skipping contamination residual visualization")
+        return
+    
+    try:
+        # Extract RA/Dec from both catalogs
+        ra_before = positions_before[0]
+        dec_before = positions_before[1]
+        ra_after = positions_after[0]
+        dec_after = positions_after[1]
+        
+        # Convert to HEALPix pixels
+        npix = hp.nside2npix(nside)
+        
+        # Uniform catalog density map
+        theta_before = np.radians(90.0 - dec_before)
+        phi_before = np.radians(ra_before)
+        pix_before = hp.ang2pix(nside, theta_before, phi_before, nest=False)
+        
+        density_before = np.zeros(npix)
+        np.add.at(density_before, pix_before, 1)
+        
+        # Contaminated catalog density map
+        theta_after = np.radians(90.0 - dec_after)
+        phi_after = np.radians(ra_after)
+        pix_after = hp.ang2pix(nside, theta_after, phi_after, nest=False)
+        
+        density_after = np.zeros(npix)
+        np.add.at(density_after, pix_after, 1)
+        
+        # Normalize by pixel area to get surface density (galaxies per deg^2)
+        pixel_area = hp.nside2pixarea(nside, degrees=True)
+        density_before /= pixel_area
+        density_after /= pixel_area
+        
+        # Residual: contaminated - uniform
+        residual = density_after - density_before
+        
+        # Create figure with 3 subplots
+        fig = plt.figure(figsize=(16, 5))
+        
+        # Uniform baseline
+        ax1 = fig.add_subplot(131)
+        hp.mollview(density_before, fig=fig, sub=(1, 3, 1), cmap="viridis", 
+                   title="Uniform Baseline (galaxies/deg²)")
+        
+        # Contaminated
+        ax2 = fig.add_subplot(132)
+        hp.mollview(density_after, fig=fig, sub=(1, 3, 2), cmap="viridis",
+                   title="Contaminated (galaxies/deg²)")
+        
+        # Residual (symmetric colormap around zero)
+        ax3 = fig.add_subplot(133)
+        vmax = np.nanmax(np.abs(residual))
+        hp.mollview(residual, fig=fig, sub=(1, 3, 3), cmap="RdBu_r", min=-vmax, max=vmax,
+                   title="Residual (Contam - Uniform) (galaxies/deg²)")
+        
+        fig.suptitle(f"Mock #{mock_idx}: Contamination Angular Residual (z={zmin:.1f}–{zmax:.1f})", 
+                     fontsize=14, y=0.98)
+        
+        # Save figure
+        fig_dir = os.path.join(config_cache_dir, "figures")
+        os.makedirs(fig_dir, exist_ok=True)
+        fig_path = os.path.join(fig_dir, f"contamination_healpix_residual_mock{mock_idx}.png")
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        
+        print(f"Saved contamination residual HEALPix map: {fig_path}")
+        print(f"  Residual stats: mean={residual.mean():.2e}, "
+              f"std={residual.std():.2e}, min={residual.min():.2e}, max={residual.max():.2e}")
+        
+    except Exception as e:
+        print(f"Warning: Failed to generate contamination residual visualization: {e}")
+
+
 def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalog, mock_idx: int) -> PreparedCatalog:
     seeds = _stage_seeds(spec, mock_idx)
     periodic = (spec.mock_type == 'quijote')
     boxsize_use = spec.boxsize * spec.rep_fac if spec.replicate else spec.boxsize
+    
+    # Store pre-contamination positions for visualization
+    positions_before = catalog.positions_rdd.copy()
     
     # Use cached contamination map (computed once per mock_idx, reused across modes)
     sys_map = _get_or_compute_contamination_map(spec, mock_idx, catalog)
@@ -706,7 +891,7 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
         n_inject = len(ra_inject)
         rand_indices = rng.choice(len(catalog.base_r), size=n_inject, replace=True)
         r_star = catalog.base_r[rand_indices]
-        galpos_inj = np.vstack([ra_inject, dec_inject, r_star])
+        galpos_inj = np.vstack([ra_inject, dec_inject, r_star]).astype(catalog.positions_rdd.dtype)
 
         print('gal pos inject from healpix map has shape', galpos_inj.shape)
 
@@ -732,16 +917,26 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
                 pix_gal = hp.ang2pix(nside_map, theta_gal, phi_gal, nest=False)
                 
                 # Compute removal probability for each galaxy based on local map value
-                removal_probs = negative_map[pix_gal] / max_removal_prob
+        removal_probs_base = negative_map[pix_gal] / max_removal_prob
+        
+        # Rescale removal probabilities so expected removal count ≈ n_inject
+        # E[n_removed] = sum(removal_probs), so we rescale to match n_inject
+        expected_removal_base = removal_probs_base.sum()
+        if expected_removal_base > 0 and n_inject > 0:
+            # Target: E[n_removed] = n_inject for mean conservation
+            rescale_factor = n_inject / expected_removal_base
+            # Clip to [0, 1] to keep valid probabilities
+            removal_probs = np.clip(removal_probs_base * rescale_factor, 0.0, 1.0)
+        else:
+            removal_probs = removal_probs_base
+        
+        # Probabilistically mark galaxies for removal
+        u_remove = rng.uniform(0.0, 1.0, size=n_gal)
+        removal_mask = u_remove >= removal_probs  # Keep if u >= prob
+        n_removed = np.sum(~removal_mask)
                 
-                # Probabilistically mark galaxies for removal
-                u_remove = rng.uniform(0.0, 1.0, size=n_gal)
-                removal_mask = u_remove >= removal_probs  # Keep if u >= prob
-                n_removed = np.sum(~removal_mask)
-                
-                print(f'Mean-conserving removal: {n_removed} galaxies marked for removal '
-                      f'({100.0 * n_removed / n_gal:.2f}% of catalog)')
-
+        print(f'Mean-conserving removal: targeted n_remove={n_inject}, '
+              f'actual n_removed={n_removed} ({100.0 * n_removed / n_gal:.2f}% of catalog)')
     else:
         # Periodic 2D FFT path: sample positions uniformly in transverse plane,
         # then accept/reject with probability proportional to positive part of map.
@@ -772,7 +967,7 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
             galpos_inj = np.stack([xs_inj, ys_inj, zs_inj], axis=1).T
 
 
-    inject_weights = np.ones(n_inject, dtype=float)
+    inject_weights = np.ones(n_inject, dtype=catalog.weights.dtype)
 
     print('positions rdd has shape', catalog.positions_rdd.shape)
     print('inject positions has shape', galpos_inj.shape)
@@ -781,15 +976,78 @@ def _apply_transverse_additive_sys(spec: ExperimentSpec, catalog: PreparedCatalo
     if not periodic and spec.mean_conserving_additive and n_removed > 0:
         catalog.positions_rdd = catalog.positions_rdd[:, removal_mask]
         catalog.weights = catalog.weights[removal_mask]
+        if catalog.base_r is not None:
+            catalog.base_r = catalog.base_r[removal_mask]
+        if catalog.base_redshifts is not None:
+            catalog.base_redshifts = catalog.base_redshifts[removal_mask]
         print(f'After removal: catalog has {catalog.positions_rdd.shape[1]} galaxies')
 
     catalog.positions_rdd = np.concatenate([catalog.positions_rdd, galpos_inj], axis=1)
+    
+    # Ensure array is C-contiguous for pypower
+    if not catalog.positions_rdd.flags['C_CONTIGUOUS']:
+        catalog.positions_rdd = np.ascontiguousarray(catalog.positions_rdd)
 
     print("catalog.positions_rdd now has shape ", catalog.positions_rdd.shape)
     print('catalog.weights has shape', catalog.weights.shape)
 
     catalog.weights = np.concatenate([catalog.weights, inject_weights])
     print('catalog.weights after injection has shape', catalog.weights.shape)
+    
+    # Update base_r and base_redshifts to include injected galaxies
+    if n_inject > 0:
+        import astropy.units as u
+        # Extract radii from injected positions
+        r_inject = galpos_inj[2]  # Third row is radius
+        print('r inject has range:', r_inject.min(), r_inject.max())
+        
+        # Extend base_r (ensure same dtype)
+        if catalog.base_r is not None:
+            r_inject_typed = np.asarray(r_inject, dtype=catalog.base_r.dtype)
+            catalog.base_r = np.concatenate([catalog.base_r, r_inject_typed])
+        
+        # Extend base_redshifts by converting injected radii to redshifts
+        if catalog.base_redshifts is not None:
+            chi_interp = grab_chi_interp()
+            z_inject = comoving_distance_to_redshift(r_inject / cosmo.h * u.Mpc, chi_interp)
+            # Extract value if it's an astropy Quantity
+            if hasattr(z_inject, 'value'):
+                z_inject = z_inject.value
+            z_inject_typed = np.asarray(z_inject, dtype=catalog.base_redshifts.dtype)
+            catalog.base_redshifts = np.concatenate([catalog.base_redshifts, z_inject_typed])
+    
+    # Generate visualization of contamination residual (halfdome only)
+    if not periodic and spec.generate_uniform_catalog:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(5, 5))
+        plt.hist(catalog.base_r, bins=50, alpha=0.5, label='After Contamination')
+        plt.xlabel('$\\chi$ [Mpc/h]', fontsize=14)
+        plt.ylabel('Number of Galaxies', fontsize=14)
+        plt.legend()
+        plt.savefig(os.path.join(spec.save_dir, f"radius_distribution_mock{mock_idx}.png"), dpi=150)
+        plt.show()
+
+        plt.figure(figsize=(5, 5))
+        plt.hist(catalog.base_redshifts, bins=50, alpha=0.5, label='After Contamination')
+        plt.xlabel('Redshift', fontsize=14)
+        plt.ylabel('Number of Galaxies', fontsize=14)
+        plt.legend()
+        plt.savefig(os.path.join(spec.save_dir, f"redshift_distribution_mock{mock_idx}.png"), dpi=150)
+        plt.show()
+
+
+        try:
+            plot_contamination_healpix_residual(
+                positions_before=positions_before,
+                positions_after=catalog.positions_rdd,
+                mock_idx=mock_idx,
+                config_cache_dir=spec.save_dir,
+                zmin=spec.zmin,
+                zmax=spec.zmax,
+                nside=128,
+            )
+        except Exception as e:
+            print(f"Warning: Failed to generate contamination residual visualization: {e}")
 
     return catalog
 
@@ -947,6 +1205,37 @@ def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> Tup
     if spec.redshift_sel:
         chi_interp = grab_chi_interp()
         
+        # For uniform Poisson catalogs, generate truly uniform randoms (not matching data distribution)
+        if spec.generate_uniform_catalog and catalog.metadata.get('uniform_catalog', False):
+            print("Generating uniform randoms for uniform Poisson catalog...")
+            rng = np.random.default_rng(seeds['randoms'])
+            r_min = chi_interp(spec.zmin)
+            r_max = chi_interp(spec.zmax)
+            
+            # Generate uniform RA/Dec on full sky
+            ra_rand = rng.uniform(0.0, 360.0, size=n_randoms)
+            sin_dec = rng.uniform(-1.0, 1.0, size=n_randoms)
+            dec_rand = np.degrees(np.arcsin(sin_dec))
+            
+            # Uniform comoving distance in [r_min, r_max]
+            r_rand = rng.uniform(r_min, r_max, size=n_randoms)
+            
+            rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
+            rand_weights = np.ones_like(ra_rand, dtype=float)
+            print(f'  Uniform randoms: {n_randoms:,} points in r=[{r_min:.1f}, {r_max:.1f}] Mpc/h')
+            
+            # Apply galactic latitude cut if requested
+            if spec.gal_lat_cut_deg > 0.0:
+                b_rand = _gal_lat_b(rand_positions[0], rand_positions[1])
+                keep = np.abs(b_rand) >= spec.gal_lat_cut_deg
+                n_before = rand_positions.shape[1]
+                rand_positions = rand_positions[:, keep]
+                rand_weights = rand_weights[keep]
+                print(f'  gal_lat_cut |b|>{spec.gal_lat_cut_deg:.1f}° applied to randoms: '
+                      f'{n_before:,} → {rand_positions.shape[1]:,}')
+            
+            return rand_positions, rand_weights
+        
         # Use original (pre-mask) z-distribution for randoms to maintain constant comoving density
         redshift_source = catalog.metadata.get('original_base_redshifts')
         if redshift_source is None:
@@ -986,18 +1275,6 @@ def _build_random_catalog(spec: ExperimentSpec, catalog: PreparedCatalog) -> Tup
                 )
                 rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
                 rand_weights = np.ones_like(ra_rand, dtype=float)
-        else:
-            # Standard generation for non-Gaia modes
-            ra_rand, dec_rand, r_rand, _ = generate_uniform_randoms(
-                chi_interp,
-                n_randoms,
-                zmin=spec.zmin,
-                zmax=spec.zmax,
-                data_z=redshift_source,
-                seed=seeds['randoms'],
-            )
-            rand_positions = np.array([ra_rand, dec_rand, r_rand], dtype=float)
-            rand_weights = np.ones_like(ra_rand, dtype=float)
         
         # Apply galactic latitude cut (standard cut, independent of Gaia mask)
         if spec.gal_lat_cut_deg > 0.0:
@@ -1235,6 +1512,18 @@ def _compute_raw_multipoles(
 
         # For halfdome, compute poles only; for quijote, poles are automatic
         if spec.mock_type == 'halfdome':
+            # Diagnostic: check positions before passing to CatalogFFTPower
+            print(f'DEBUG: catalog.positions_rdd shape={catalog.positions_rdd.shape}, dtype={catalog.positions_rdd.dtype}')
+            print(f'DEBUG: catalog.positions_rdd[0] (RA) range: [{catalog.positions_rdd[0].min():.3f}, {catalog.positions_rdd[0].max():.3f}]')
+            print(f'DEBUG: catalog.positions_rdd[1] (Dec) range: [{catalog.positions_rdd[1].min():.3f}, {catalog.positions_rdd[1].max():.3f}]')
+            print(f'DEBUG: catalog.positions_rdd[2] (r) range: [{catalog.positions_rdd[2].min():.3f}, {catalog.positions_rdd[2].max():.3f}]')
+            print(f'DEBUG: First 3 data positions: {catalog.positions_rdd[:, :3]}')
+            print(f'DEBUG: rand_positions shape={rand_positions.shape}, dtype={rand_positions.dtype}')
+            print(f'DEBUG: rand_positions[0] (RA) range: [{rand_positions[0].min():.3f}, {rand_positions[0].max():.3f}]')
+            print(f'DEBUG: rand_positions[1] (Dec) range: [{rand_positions[1].min():.3f}, {rand_positions[1].max():.3f}]')
+            print(f'DEBUG: rand_positions[2] (r) range: [{rand_positions[2].min():.3f}, {rand_positions[2].max():.3f}]')
+            print(f'DEBUG: nmesh={spec.nmesh}, los={los}, position_type={position_type}')
+            
             result = CatalogFFTPower(
                 data_positions1=catalog.positions_rdd,
                 data_weights1=catalog.weights,
@@ -1457,7 +1746,10 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: Optional[desi
     if dm is None:
         dm = desi_mock()
 
-    if spec.mock_type == 'quijote':
+    if spec.generate_uniform_catalog:
+        print("Preparing uniform Poisson catalog...")
+        catalog = _prepare_uniform_poisson_catalog(spec, mock_idx)
+    elif spec.mock_type == 'quijote':
         print("Preparing Quijote catalog...")
         catalog = _prepare_quijote_catalog(spec, mock_idx, dm)
     elif spec.mock_type == 'halfdome':
@@ -1468,7 +1760,7 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: Optional[desi
             f"Unsupported mock_type='{spec.mock_type}'. Supported options are 'quijote' and 'halfdome'."
         )
 
-    if spec.redshift_sel:
+    if spec.redshift_sel and not spec.generate_uniform_catalog:
         print("Applying redshift selection...")
         redshift_mask = np.ones_like(catalog.base_redshifts, dtype=bool)
         if spec.zmin is not None:
@@ -1513,6 +1805,40 @@ def run_single_experiment(spec: ExperimentSpec, mock_idx: int, dm: Optional[desi
 
     print('Applying contamination...')
     catalog = _apply_contamination(spec, catalog, mock_idx)
+    
+    # For uniform Poisson catalogs with applied contamination, regenerate radii uniformly
+    # to maintain the uniform clustering baseline. This ensures the only power is from systematics.
+    if spec.generate_uniform_catalog and catalog.metadata.get('uniform_catalog', False):
+        print("Regenerating uniform radii for contaminated catalog...")
+        seeds = _stage_seeds(spec, mock_idx)
+        rng = np.random.default_rng(seeds['regenerate_radii'])
+        
+        chi_interp = grab_chi_interp()
+        r_min = chi_interp(spec.zmin)
+        r_max = chi_interp(spec.zmax)
+        
+        n_gal = catalog.positions_rdd.shape[1]
+        
+        # Sample radii uniformly in comoving distance
+        r_uniform = rng.uniform(r_min, r_max, size=n_gal)
+        
+        # Update positions and redshifts
+        catalog.positions_rdd[2, :] = r_uniform.astype(catalog.positions_rdd.dtype)
+        
+        # Update base_r and base_redshifts
+        if catalog.base_r is not None:
+            catalog.base_r = r_uniform.astype(catalog.base_r.dtype)
+        
+        if catalog.base_redshifts is not None:
+            import astropy.units as u
+            z_uniform = comoving_distance_to_redshift(r_uniform / cosmo.h * u.Mpc, chi_interp)
+            if hasattr(z_uniform, 'value'):
+                z_uniform = z_uniform.value
+            catalog.base_redshifts = z_uniform.astype(catalog.base_redshifts.dtype)
+        
+        print(f"  Regenerated uniform radii: r_min={r_min:.1f}, r_max={r_max:.1f} Mpc/h")
+        print(f"  Catalog radii after regeneration: {catalog.positions_rdd[2].min():.1f} to {catalog.positions_rdd[2].max():.1f}")
+
 
     if spec.mock_type == 'quijote':
         rand_positions, rand_weights = _build_random_catalog_periodic(spec, catalog)  # Pre-build randoms for periodic box to ensure consistency across modes
